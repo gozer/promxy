@@ -1,0 +1,7 @@
+version: "1"
+rules:
+  - base: master
+    upstream:  jacksontj:master
+    mergeMethod: hardreset
+  - base: maintainer
+    upstream: master
