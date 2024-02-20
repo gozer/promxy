@@ -1,0 +1,13 @@
+apiVersion: v1
+entries:
+  promxy:
+  - apiVersion: v1
+    appVersion: 0.0.1
+    created: "2024-02-20T15:41:03.309804337Z"
+    description: Prometheus proxy to combine multiple prometheuses
+    digest: 568345001d0132661d09413cf39a838331ea0609fefc7404ca762ba9f20da127
+    name: promxy
+    urls:
+    - https://github.com/gozer/promxy/releases/download/promxy-0.0.1/promxy-0.0.1.tgz
+    version: 0.0.1
+generated: "2024-02-20T15:41:03.309812753Z"
