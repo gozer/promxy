@@ -106,6 +106,10 @@ func (s *ServerGroup) RoundTrip(r *http.Request) (*http.Response, error) {
 	for k, v := range middleware.GetHeaders(r.Context()) {
 		r.Header.Set(k, v)
 	}
+	for k, v := range s.Cfg.HTTPClientHeaders {
+		r.Header.Set(k, v)
+		logrus.Tracef("Set ServerGroup custom header %s: %s", k, v)
+	}
 	return s.client.Transport.RoundTrip(r)
 }
 
@@ -296,6 +300,10 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 
 	if s.Cfg.IgnoreError {
 		newState.apiClient = &promclient.IgnoreErrorAPI{newState.apiClient}
+	}
+
+	if s.Cfg.DowngradeError {
+		newState.apiClient = &promclient.DowngradeErrorAPI{newState.apiClient}
 	}
 
 	oldState := s.State()   // Fetch the current state (so we can stop it)

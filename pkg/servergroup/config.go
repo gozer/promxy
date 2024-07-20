@@ -153,6 +153,11 @@ type Config struct {
 	// Note: this allows you to make the tradeoff between availability of queries and consistency of results
 	IgnoreError bool `yaml:"ignore_error"`
 
+	// DowngradeError converts all errors to warnings from this given servergroup effectively making
+	// the responses from this servergroup "not required" for the result.
+	// Note: this allows you to make the tradeoff between availability of queries and consistency of results
+	DowngradeError bool `yaml:"downgrade_error"`
+
 	// RelativeTimeRangeConfig defines a relative time range that this servergroup will respond to
 	// An example use-case would be if a specific servergroup was long-term storage, it might only
 	// have data 3d old and retain 90d of data.
@@ -190,6 +195,12 @@ type Config struct {
 	LabelFilterConfig *promclient.LabelFilterConfig `yaml:"label_filter"`
 
 	PreferMax bool `yaml:"prefer_max,omitempty"`
+
+	// HTTPClientHeaders are a map of HTTP headers to add to remote read HTTP calls made to this downstream
+	// the main use-case for this is to support the X-Scope-OrgID header required by Mimir and Cortex
+	// in multi-tenancy mode
+	// (see https://github.com/jacksontj/promxy/issues/643)
+	HTTPClientHeaders map[string]string `yaml:"http_headers"`
 }
 
 // GetScheme returns the scheme for this servergroup
