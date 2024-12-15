@@ -18,7 +18,7 @@ import (
 
 	_ "net/http/pprof"
 
-	kitlog "github.com/go-kit/kit/log"
+	kitlog "github.com/go-kit/log"
 	"github.com/golang/glog"
 	"github.com/grafana/regexp"
 	"github.com/jessevdk/go-flags"
@@ -38,6 +38,7 @@ import (
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
+	promlogging "github.com/prometheus/prometheus/util/logging"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/prometheus/prometheus/web"
 	"github.com/sirupsen/logrus"
@@ -90,6 +91,7 @@ type cliOpts struct {
 	ProxyHeaders []string `long:"proxy-headers" env:"PROXY_HEADERS" description:"a list of headers to proxy to downstream servergroups."`
 
 	ExternalURL     string `long:"web.external-url" description:"The URL under which Prometheus is externally reachable (for example, if Prometheus is served via a reverse proxy). Used for generating relative and absolute links back to Prometheus itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Prometheus. If omitted, relevant URL components will be derived automatically."`
+	RoutePrefix     string `long:"web.route-prefix" description:"Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url."`
 	EnableLifecycle bool   `long:"web.enable-lifecycle" description:"Enable shutdown and reload via HTTP request."`
 
 	QueryTimeout        time.Duration `long:"query.timeout" description:"Maximum time a query may take before being aborted." default:"2m"`
@@ -368,6 +370,22 @@ func main() {
 		return nil
 	}}))
 
+	// PromQL query engine reloadable
+	reloadables = append(reloadables, proxyconfig.WrapPromReloadable(&proxyconfig.ApplyConfigFunc{func(cfg *config.Config) error {
+		if cfg.GlobalConfig.QueryLogFile == "" {
+			engine.SetQueryLogger(nil)
+			return nil
+		}
+
+		l, err := promlogging.NewJSONFileLogger(cfg.GlobalConfig.QueryLogFile)
+		if err != nil {
+			return err
+		}
+		engine.SetQueryLogger(l)
+
+		return nil
+	}}))
+
 	// We need an empty scrape manager, simply to make the API not panic and error out
 	scrapeManager := scrape.NewManager(nil, kitlog.With(logger, "component", "scrape manager"), nil)
 
@@ -389,7 +407,7 @@ func main() {
 		EnableLifecycle: opts.EnableLifecycle,
 
 		Flags:       opts.ToFlags(),
-		RoutePrefix: "/",
+		RoutePrefix: opts.RoutePrefix,
 		ExternalURL: externalUrl,
 		Version: &web.PrometheusVersion{
 			Version:   version.Version,
@@ -406,9 +424,12 @@ func main() {
 		logrus.Fatalf("Error parsing CORS regex: %v", err)
 	}
 
-	if externalUrl != nil && externalUrl.Path != "" {
+	// Default -web.route-prefix to path of -web.external-url.
+	if webOptions.RoutePrefix == "" {
 		webOptions.RoutePrefix = externalUrl.Path
 	}
+	// RoutePrefix must always be at least '/'.
+	webOptions.RoutePrefix = "/" + strings.Trim(webOptions.RoutePrefix, "/")
 
 	webHandler := web.New(logger, webOptions)
 	reloadables = append(reloadables, proxyconfig.WrapPromReloadable(webHandler))
@@ -427,7 +448,7 @@ func main() {
 	r.NotFound = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Have our fallback rules
 		if strings.HasPrefix(r.URL.Path, path.Join(webOptions.RoutePrefix, "/debug")) {
-			http.StripPrefix(webOptions.RoutePrefix, http.DefaultServeMux).ServeHTTP(w, r)
+			http.StripPrefix(strings.Trim(webOptions.RoutePrefix, "/"), http.DefaultServeMux).ServeHTTP(w, r)
 		} else if r.URL.Path == path.Join(webOptions.RoutePrefix, "/-/ready") {
 			if stopping {
 				w.WriteHeader(http.StatusServiceUnavailable)
