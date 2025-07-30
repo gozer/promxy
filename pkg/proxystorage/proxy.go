@@ -260,12 +260,12 @@ func (p *ProxyStorage) MetadataHandler(w http.ResponseWriter, r *http.Request) {
 func (p *ProxyStorage) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
 	state := p.GetState()
 	return &proxyquerier.ProxyQuerier{
-		ctx,
-		timestamp.Time(mint).UTC(),
-		timestamp.Time(maxt).UTC(),
-		state.client,
+		Ctx:    ctx,
+		Start:  timestamp.Time(mint).UTC(),
+		End:    timestamp.Time(maxt).UTC(),
+		Client: state.client,
 
-		&state.cfg.PromxyConfig,
+		Cfg: &state.cfg.PromxyConfig,
 	}, nil
 }
 
@@ -321,6 +321,11 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		return ok
 	}
 
+	isBinaryExpr := func(node parser.Node) bool {
+		_, ok := node.(*parser.BinaryExpr)
+		return ok
+	}
+
 	isVectorSelector := func(node parser.Node) bool {
 		_, ok := node.(*parser.VectorSelector)
 		return ok
@@ -342,20 +347,27 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 	// If there is a child that is an aggregator we cannot do anything (as they have their own
 	// rules around combining). We'll skip this node and let a lower layer take this on
-	aggFinder := &BooleanFinder{Func: isAgg}
-	offsetFinder := &OffsetFinder{}
-	vecFinder := &BooleanFinder{Func: isVectorSelector}
-	timestampFinder := &BooleanFinder{Func: hasTimestamp}
+	aggFinder := &promclient.BooleanFinder{Func: isAgg}
+	offsetFinder := &promclient.OffsetFinder{}
+	vecFinder := &promclient.BooleanFinder{Func: isVectorSelector}
+	timestampFinder := &promclient.BooleanFinder{Func: hasTimestamp}
 
-	visitor := NewMultiVisitor([]parser.Visitor{aggFinder, offsetFinder, vecFinder, timestampFinder})
+	visitor := promclient.NewMultiVisitor([]parser.Visitor{aggFinder, offsetFinder, vecFinder, timestampFinder})
 
 	if _, err := parser.Walk(ctx, visitor, s, node, nil, nil); err != nil {
 		return nil, err
 	}
 
 	if aggFinder.Found > 0 {
-		// If there was a single agg and that was us, then we're okay
-		if !((isAgg(node) || isSubQuery(node)) && aggFinder.Found == 1) {
+
+		switch {
+		// // If there was a single agg and that was us, then we're okay
+		case (isAgg(node) || isBinaryExpr(node)) && aggFinder.Found == 1:
+			break
+		// If the aggregations are in a SubQuery; we can allow Subquery to run through NodeReplacerZz
+		case isSubQuery(node):
+			break
+		default:
 			return nil, nil
 		}
 	}
@@ -390,7 +402,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 	// that the time be the absolute time, whereas the API returns them based on the
 	// range you ask for (with the offset being implicit)
 	removeOffsetFn := func() error {
-		_, err := parser.Walk(ctx, &OffsetRemover{}, s, node, nil, nil)
+		_, err := parser.Walk(ctx, &promclient.OffsetRemover{}, s, node, nil, nil)
 		return err
 	}
 
@@ -399,6 +411,13 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 	// Some AggregateExprs can be composed (meaning they are "reentrant". If the aggregation op
 	// is reentrant/composable then we'll do so, otherwise we let it fall through to normal query mechanisms
 	case *parser.AggregateExpr:
+		// If the vector selector already has the data we can skip
+		if vs, ok := n.Expr.(*parser.VectorSelector); ok {
+			if vs.UnexpandedSeriesSet != nil {
+				return nil, nil
+			}
+		}
+
 		logrus.Debugf("AggregateExpr %v %s", n, n.Op)
 
 		var result model.Value
@@ -447,11 +466,11 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 				return &parser.AggregateExpr{
 					Op: parser.MAX,
-					Expr: PreserveLabel(&parser.BinaryExpr{
+					Expr: promclient.PreserveLabel(&parser.BinaryExpr{
 						Op: parser.DIV,
 						LHS: &parser.AggregateExpr{
 							Op:       parser.SUM,
-							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
+							Expr:     promclient.PreserveLabel(promclient.CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
@@ -459,7 +478,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 						RHS: &parser.AggregateExpr{
 							Op:       parser.COUNT,
-							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
+							Expr:     promclient.PreserveLabel(promclient.CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
@@ -477,7 +496,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 				Op: parser.DIV,
 				LHS: &parser.AggregateExpr{
 					Op:       parser.SUM,
-					Expr:     CloneExpr(n.Expr),
+					Expr:     promclient.CloneExpr(n.Expr),
 					Param:    n.Param,
 					Grouping: n.Grouping,
 					Without:  n.Without,
@@ -485,7 +504,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 				RHS: &parser.AggregateExpr{
 					Op:       parser.COUNT,
-					Expr:     CloneExpr(n.Expr),
+					Expr:     promclient.CloneExpr(n.Expr),
 					Param:    n.Param,
 					Grouping: n.Grouping,
 					Without:  n.Without,
@@ -636,7 +655,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		// we can set it as the args (the vector of data) and the promql engine handles the types properly
 		case "scalar":
 			n.Args[0] = ret
-			return nil, nil
+			return n, nil
 		// the functions of sort() and sort_desc() need whole results to calculate.
 		case "sort", "sort_desc":
 			return &parser.Call{
@@ -695,6 +714,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		}
 		n.OriginalOffset = offset
 		n.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
+		return n, nil
 
 	// If we hit this someone is asking for a matrix directly, if so then we don't
 	// have anyway to ask for less-- since this is exactly what they are asking for
@@ -731,6 +751,118 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		if newN != nil {
 			n.Expr = newN.(parser.Expr)
 			return n, nil
+		}
+
+	// BinaryExprs *can* be sent untouched to downstreams assuming there is no actual interaction between LHS/RHS
+	// these are relatively rare -- as things like `sum(foo) > 2` would *not* be viable as `sum(foo)` could
+	// potentially require multiple servergroups to generate the correct response.
+	// From inspection there are only 3 specific types where this sort of replacement is "safe" (assuming one side is a literal)
+	// 	`VectorSector`
+	// 	`AggregateExpr` (Max, Min, TopK, BottomK only -- and only if re-combined)
+	case *parser.BinaryExpr:
+		logrus.Debugf("BinaryExpr: %v", n)
+
+		// vectorBinaryExpr will send the node as a query to the downstream and return an expanded VectorSelector
+		vectorBinaryExpr := func(vs *parser.VectorSelector) (parser.Node, error) {
+			logrus.Debugf("BinaryExpr (VectorSelector + Literal): %v", n)
+			removeOffsetFn()
+
+			var result model.Value
+			var warnings v1.Warnings
+			var err error
+			if s.Interval > 0 {
+				vs.LookbackDelta = s.Interval - time.Duration(1)
+				result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
+					Start: s.Start.Add(-offset),
+					End:   s.End.Add(-offset),
+					Step:  s.Interval,
+				})
+			} else {
+				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-offset))
+			}
+
+			if err != nil {
+				return nil, err
+			}
+
+			iterators := promclient.IteratorsForValue(result)
+			series := make([]storage.Series, len(iterators))
+			for i, iterator := range iterators {
+				series[i] = &proxyquerier.Series{iterator}
+			}
+
+			ret := &parser.VectorSelector{OriginalOffset: offset}
+			if s.Interval > 0 {
+				ret.LookbackDelta = s.Interval - time.Duration(1)
+			}
+			ret.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
+			return ret, nil
+		}
+
+		// aggregateBinaryExpr will send the node as a query to the downstream and
+		// replace the aggregate expr with the resulting data. This will cause the aggregation
+		// (min, max, topk, bottomk) to be re-run against the expression.
+		aggregateBinaryExpr := func(agg *parser.AggregateExpr) (parser.Node, error) {
+			logrus.Debugf("BinaryExpr (AggregateExpr + Literal): %v", n)
+
+			removeOffsetFn()
+
+			var (
+				result   model.Value
+				warnings v1.Warnings
+				err      error
+			)
+
+			if s.Interval > 0 {
+				result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
+					Start: s.Start.Add(-offset),
+					End:   s.End.Add(-offset),
+					Step:  s.Interval,
+				})
+			} else {
+				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-offset))
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			iterators := promclient.IteratorsForValue(result)
+
+			series := make([]storage.Series, len(iterators))
+			for i, iterator := range iterators {
+				series[i] = &proxyquerier.Series{iterator}
+			}
+
+			ret := &parser.VectorSelector{OriginalOffset: offset}
+			if s.Interval > 0 {
+				ret.LookbackDelta = s.Interval - time.Duration(1)
+			}
+			ret.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
+
+			agg.Expr = ret
+			return agg, nil
+		}
+
+		// Only valid if the other side is either `NumberLiteral` or `StringLiteral`
+		this := n.LHS
+		other := n.RHS
+		literal := promclient.ExprIsLiteral(promclient.UnwrapExpr(this))
+		if !literal {
+			this = n.RHS
+			other = n.LHS
+			literal = promclient.ExprIsLiteral(promclient.UnwrapExpr(this))
+		}
+		// If one side is a literal lets check
+		if literal {
+			switch otherTyped := other.(type) {
+			case *parser.VectorSelector:
+				return vectorBinaryExpr(otherTyped)
+			case *parser.AggregateExpr:
+				switch otherTyped.Op {
+				case parser.MIN, parser.MAX, parser.TOPK, parser.BOTTOMK:
+					return aggregateBinaryExpr(otherTyped)
+				}
+			}
 		}
 
 	default:
