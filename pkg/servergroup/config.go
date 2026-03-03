@@ -6,6 +6,7 @@ import (
 
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/sigv4"
 
 	"github.com/jacksontj/promxy/pkg/promclient"
 
@@ -16,11 +17,14 @@ import (
 var (
 	// DefaultConfig is the Default base promxy configuration
 	DefaultConfig = Config{
-		AntiAffinity:   time.Second * 10,
-		Scheme:         "http",
-		RemoteReadPath: "api/v1/read",
-		Timeout:        0,
-		PreferMax:      false,
+		AntiAffinity:        time.Second * 10,
+		Scheme:              "http",
+		RemoteReadPath:      "api/v1/read",
+		Timeout:             0,
+		MaxIdleConns:        20000,
+		MaxIdleConnsPerHost: 1000,
+		IdleConnTimeout:     5 * time.Minute,
+		PreferMax:           false,
 		HTTPConfig: HTTPClientConfig{
 			DialTimeout: time.Millisecond * 200, // Default dial timeout of 200ms
 		},
@@ -148,10 +152,24 @@ type Config struct {
 	// time does not include the time to read the response body.
 	Timeout time.Duration `yaml:"timeout,omitempty"`
 
+	// MaxIdleConns, servergroup maximum number of idle connections to keep open.
+	MaxIdleConns int `yaml:"max_idle_conns,omitempty"`
+
+	// MaxIdleConnsPerHost, servergroup maximum number of idle connections to keep open per host.
+	MaxIdleConnsPerHost int `yaml:"max_idle_conns_per_host,omitempty"`
+
+	// IdleConnTimeout, time wait to close a idle connections.
+	IdleConnTimeout time.Duration `yaml:"idle_conn_timeout,omitempty"`
+
 	// IgnoreError will hide all errors from this given servergroup effectively making
 	// the responses from this servergroup "not required" for the result.
 	// Note: this allows you to make the tradeoff between availability of queries and consistency of results
 	IgnoreError bool `yaml:"ignore_error"`
+
+	// DowngradeError converts all errors to warnings from this given servergroup effectively making
+	// the responses from this servergroup "not required" for the result.
+	// Note: this allows you to make the tradeoff between availability of queries and consistency of results
+	DowngradeError bool `yaml:"downgrade_error"`
 
 	// RelativeTimeRangeConfig defines a relative time range that this servergroup will respond to
 	// An example use-case would be if a specific servergroup was long-term storage, it might only
@@ -190,6 +208,12 @@ type Config struct {
 	LabelFilterConfig *promclient.LabelFilterConfig `yaml:"label_filter"`
 
 	PreferMax bool `yaml:"prefer_max,omitempty"`
+
+	// HTTPClientHeaders are a map of HTTP headers to add to remote read HTTP calls made to this downstream
+	// the main use-case for this is to support the X-Scope-OrgID header required by Mimir and Cortex
+	// in multi-tenancy mode
+	// (see https://github.com/jacksontj/promxy/issues/643)
+	HTTPClientHeaders map[string]string `yaml:"http_headers"`
 }
 
 // GetScheme returns the scheme for this servergroup
@@ -215,6 +239,41 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
+	if err := c.validateAuthConfig(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateAuthConfig ensures that at most one authentication method is configured
+func (c *Config) validateAuthConfig() error {
+	authMethods := []string{}
+
+	if c.HTTPConfig.HTTPConfig.BasicAuth != nil {
+		authMethods = append(authMethods, "basic_auth")
+	}
+
+	if c.HTTPConfig.HTTPConfig.Authorization != nil {
+		authMethods = append(authMethods, "authorization")
+	}
+
+	if len(c.HTTPConfig.HTTPConfig.BearerToken) > 0 {
+		authMethods = append(authMethods, "bearer_token")
+	}
+
+	if len(c.HTTPConfig.HTTPConfig.BearerTokenFile) > 0 {
+		authMethods = append(authMethods, "bearer_token_file")
+	}
+
+	if c.HTTPConfig.SigV4Config != nil {
+		authMethods = append(authMethods, "sigv4")
+	}
+
+	if len(authMethods) > 1 {
+		return fmt.Errorf("at most one of basic_auth, authorization, bearer_token, bearer_token_file, sigv4 must be configured")
+	}
+
 	return nil
 }
 
@@ -227,6 +286,7 @@ func (c *Config) MarshalYAML() (interface{}, error) {
 type HTTPClientConfig struct {
 	DialTimeout time.Duration                `yaml:"dial_timeout"`
 	HTTPConfig  config_util.HTTPClientConfig `yaml:",inline"`
+	SigV4Config *sigv4.SigV4Config           `yaml:"sigv4,omitempty"`
 }
 
 // RelativeTimeRangeConfig configures durations relative from "now" to define
