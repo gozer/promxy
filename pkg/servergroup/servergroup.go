@@ -18,6 +18,7 @@ import (
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promlog"
+	"github.com/prometheus/common/sigv4"
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/model/labels"
@@ -105,6 +106,15 @@ func (s *ServerGroup) Cancel() {
 func (s *ServerGroup) RoundTrip(r *http.Request) (*http.Response, error) {
 	for k, v := range middleware.GetHeaders(r.Context()) {
 		r.Header.Set(k, v)
+	}
+	for k, v := range s.Cfg.HTTPClientHeaders {
+		r.Header.Set(k, v)
+		logrus.Tracef("Set ServerGroup custom header %s: %s", k, v)
+	}
+	// Ensure Body is non-nil so downstream transports (e.g. SigV4) that
+	// unconditionally read the body don't panic on GET requests.
+	if r.Body == nil {
+		r.Body = http.NoBody
 	}
 	return s.client.Transport.RoundTrip(r)
 }
@@ -212,6 +222,7 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 					cfg := &remote.ClientConfig{
 						URL:              &config_util.URL{u},
 						HTTPClientConfig: s.Cfg.HTTPConfig.HTTPConfig,
+						SigV4Config:      s.Cfg.HTTPConfig.SigV4Config,
 						Timeout:          model.Duration(time.Minute * 2),
 					}
 					remoteStorageClient, err := remote.NewReadClient("foo", cfg)
@@ -298,6 +309,10 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 		newState.apiClient = &promclient.IgnoreErrorAPI{newState.apiClient}
 	}
 
+	if s.Cfg.DowngradeError {
+		newState.apiClient = &promclient.DowngradeErrorAPI{newState.apiClient}
+	}
+
 	oldState := s.State()   // Fetch the current state (so we can stop it)
 	s.state.Store(newState) // Store new state
 	if oldState != nil {
@@ -326,15 +341,23 @@ func (s *ServerGroup) ApplyConfig(cfg *Config) error {
 	// It is applied on request. So we leave out any timings here.
 	var rt http.RoundTripper = &http.Transport{
 		Proxy:               http.ProxyURL(cfg.HTTPConfig.HTTPConfig.ProxyURL.URL),
-		MaxIdleConns:        20000,
-		MaxIdleConnsPerHost: 1000, // see https://github.com/golang/go/issues/13801
+		MaxIdleConns:        cfg.MaxIdleConns,
+		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost, // see https://github.com/golang/go/issues/13801
 		DisableKeepAlives:   false,
 		TLSClientConfig:     tlsConfig,
 		// 5 minutes is typically above the maximum sane scrape interval. So we can
 		// use keepalive for all configurations.
-		IdleConnTimeout:       5 * time.Minute,
+		IdleConnTimeout:       cfg.IdleConnTimeout,
 		DialContext:           (&net.Dialer{Timeout: cfg.HTTPConfig.DialTimeout}).DialContext,
 		ResponseHeaderTimeout: cfg.Timeout,
+	}
+
+	// If SigV4 is configured, wrap the transport with SigV4 round tripper
+	if cfg.HTTPConfig.SigV4Config != nil {
+		rt, err = sigv4.NewSigV4RoundTripper(cfg.HTTPConfig.SigV4Config, rt)
+		if err != nil {
+			return errors.Wrap(err, "error creating SigV4 round tripper")
+		}
 	}
 
 	// If a bearer token is provided, create a round tripper that will set the
