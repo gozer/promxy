@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"sync/atomic"
@@ -12,16 +13,17 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/sirupsen/logrus"
-
-	"github.com/jacksontj/promxy/pkg/remote"
 
 	"github.com/jacksontj/promxy/pkg/logging"
 	"github.com/jacksontj/promxy/pkg/promhttputil"
@@ -31,6 +33,15 @@ import (
 	"github.com/jacksontj/promxy/pkg/proxyquerier"
 	"github.com/jacksontj/promxy/pkg/servergroup"
 )
+
+// noopScrapeManager satisfies remote.ReadyScrapeManager for promxy, which has
+// no local scrape manager. Returning an error here causes upstream's
+// remote_write to skip metadata sending, which is the behavior we want.
+type noopScrapeManager struct{}
+
+func (noopScrapeManager) Get() (*scrape.Manager, error) {
+	return nil, errors.New("promxy has no scrape manager")
+}
 
 // metricNameWorkaroundLabel is a workaround from https://github.com/jacksontj/promxy/issues/274
 const metricNameWorkaroundLabel = "__name"
@@ -73,14 +84,21 @@ func (p *proxyStorageState) Cancel(n *proxyStorageState) {
 	}
 }
 
-// NewProxyStorage creates a new ProxyStorage
-func NewProxyStorage(NoStepSubqueryIntervalFn func(rangeMillis int64) int64) (*ProxyStorage, error) {
-	return &ProxyStorage{NoStepSubqueryIntervalFn: NoStepSubqueryIntervalFn}, nil
+// NewProxyStorage creates a new ProxyStorage. If localStoragePath is
+// non-empty, it is used as the base directory for the remote_write WAL
+// (durable across restarts); otherwise a temporary directory is created
+// per remote_write configuration and removed on shutdown.
+func NewProxyStorage(NoStepSubqueryIntervalFn func(rangeMillis int64) int64, localStoragePath string) (*ProxyStorage, error) {
+	return &ProxyStorage{
+		NoStepSubqueryIntervalFn: NoStepSubqueryIntervalFn,
+		localStoragePath:         localStoragePath,
+	}, nil
 }
 
 // ProxyStorage implements prometheus' Storage interface
 type ProxyStorage struct {
 	NoStepSubqueryIntervalFn func(rangeMillis int64) int64
+	localStoragePath         string
 	state                    atomic.Value
 }
 
@@ -145,20 +163,42 @@ func (p *ProxyStorage) ApplyConfig(c *proxyconfig.Config) error {
 			}
 			newState.remoteStorage = oldState.remoteStorage
 		} else {
-			remote := remote.NewStorage(logging.NewLogger(logrus.WithField("component", "remote_write").Logger), func() (int64, error) { return 0, nil }, 1*time.Second)
-			if err := remote.ApplyConfig(&c.PromConfig); err != nil {
+			walDir := p.localStoragePath
+			ephemeral := walDir == ""
+			if ephemeral {
+				dir, err := os.MkdirTemp("", "promxy-remote-wal-")
+				if err != nil {
+					return fmt.Errorf("creating remote_write WAL dir: %w", err)
+				}
+				walDir = dir
+			}
+			rs := remote.NewStorage(
+				logging.NewLogger(logrus.WithField("component", "remote_write").Logger),
+				prometheus.DefaultRegisterer,
+				func() (int64, error) { return 0, nil },
+				walDir,
+				1*time.Second,
+				noopScrapeManager{},
+			)
+			if err := rs.ApplyConfig(&c.PromConfig); err != nil {
+				if ephemeral {
+					os.RemoveAll(walDir)
+				}
 				return err
 			}
-			newState.remoteStorage = remote
-			newState.appenderCloser = remote.Close
+			newState.remoteStorage = rs
+			newState.appenderCloser = func() error {
+				closeErr := rs.Close()
+				if ephemeral {
+					os.RemoveAll(walDir)
+				}
+				return closeErr
+			}
 		}
 
-		// Whether old or new, update the appender
-		var err error
-		newState.appender, err = newState.remoteStorage.Appender()
-		if err != nil {
-			return err
-		}
+		// Whether old or new, update the appender. The remote.Storage Appender
+		// implementation does not actually use the context.
+		newState.appender = newState.remoteStorage.Appender(context.Background())
 
 	} else {
 		newState.appender = &appenderStub{}
@@ -257,15 +297,14 @@ func (p *ProxyStorage) MetadataHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Querier returns a new Querier on the storage.
-func (p *ProxyStorage) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+func (p *ProxyStorage) Querier(mint, maxt int64) (storage.Querier, error) {
 	state := p.GetState()
 	return &proxyquerier.ProxyQuerier{
-		ctx,
-		timestamp.Time(mint).UTC(),
-		timestamp.Time(maxt).UTC(),
-		state.client,
+		Start:  timestamp.Time(mint).UTC(),
+		End:    timestamp.Time(maxt).UTC(),
+		Client: state.client,
 
-		&state.cfg.PromxyConfig,
+		Cfg: &state.cfg.PromxyConfig,
 	}, nil
 }
 
@@ -283,7 +322,7 @@ func (p *ProxyStorage) Appender(context.Context) storage.Appender {
 func (p *ProxyStorage) Close() error { return nil }
 
 // ChunkQuerier returns a new ChunkQuerier on the storage.
-func (p *ProxyStorage) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
+func (p *ProxyStorage) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -293,10 +332,12 @@ func (p *ProxyStorage) ExemplarQuerier(ctx context.Context) (storage.ExemplarQue
 }
 
 // Implement web.LocalStorage
-func (p *ProxyStorage) CleanTombstones() (err error)                         { return nil }
-func (p *ProxyStorage) Delete(mint, maxt int64, ms ...*labels.Matcher) error { return nil }
-func (p *ProxyStorage) Snapshot(dir string, withHead bool) error             { return nil }
-func (p *ProxyStorage) Stats(statsByLabelName string) (*tsdb.Stats, error) {
+func (p *ProxyStorage) CleanTombstones() (err error) { return nil }
+func (p *ProxyStorage) Delete(_ context.Context, mint, maxt int64, ms ...*labels.Matcher) error {
+	return nil
+}
+func (p *ProxyStorage) Snapshot(dir string, withHead bool) error { return nil }
+func (p *ProxyStorage) Stats(statsByLabelName string, _ int) (*tsdb.Stats, error) {
 	return &tsdb.Stats{IndexPostingStats: &index.PostingsStats{}}, nil
 }
 func (p *ProxyStorage) WALReplayStatus() (tsdb.WALReplayStatus, error) {
@@ -321,6 +362,11 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		return ok
 	}
 
+	isBinaryExpr := func(node parser.Node) bool {
+		_, ok := node.(*parser.BinaryExpr)
+		return ok
+	}
+
 	isVectorSelector := func(node parser.Node) bool {
 		_, ok := node.(*parser.VectorSelector)
 		return ok
@@ -342,20 +388,27 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 	// If there is a child that is an aggregator we cannot do anything (as they have their own
 	// rules around combining). We'll skip this node and let a lower layer take this on
-	aggFinder := &BooleanFinder{Func: isAgg}
-	offsetFinder := &OffsetFinder{}
-	vecFinder := &BooleanFinder{Func: isVectorSelector}
-	timestampFinder := &BooleanFinder{Func: hasTimestamp}
+	aggFinder := &promclient.BooleanFinder{Func: isAgg}
+	offsetFinder := &promclient.OffsetFinder{}
+	vecFinder := &promclient.BooleanFinder{Func: isVectorSelector}
+	timestampFinder := &promclient.BooleanFinder{Func: hasTimestamp}
 
-	visitor := NewMultiVisitor([]parser.Visitor{aggFinder, offsetFinder, vecFinder, timestampFinder})
+	visitor := promclient.NewMultiVisitor([]parser.Visitor{aggFinder, offsetFinder, vecFinder, timestampFinder})
 
 	if _, err := parser.Walk(ctx, visitor, s, node, nil, nil); err != nil {
 		return nil, err
 	}
 
 	if aggFinder.Found > 0 {
-		// If there was a single agg and that was us, then we're okay
-		if !((isAgg(node) || isSubQuery(node)) && aggFinder.Found == 1) {
+
+		switch {
+		// // If there was a single agg and that was us, then we're okay
+		case (isAgg(node) || isBinaryExpr(node)) && aggFinder.Found == 1:
+			break
+		// If the aggregations are in a SubQuery; we can allow Subquery to run through NodeReplacerZz
+		case isSubQuery(node):
+			break
+		default:
 			return nil, nil
 		}
 	}
@@ -367,12 +420,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		return nil, nil
 	}
 
-	// If the subtree has an at modifier (e.g. "@ 500") we don't currently support those so we'll skip
-	// this is only enabled in the promql engine for tests, but if we want to support this generally we'll
-	// have to fix this
-	if timestampFinder.Found > 0 {
-		return nil, nil
-	}
+	// subtreeHasAt is true when at least one VectorSelector in this subtree has
+	// an @ modifier. With @ in play we must NOT strip offsets or shift the
+	// downstream request window: the downstream resolves `@ T offset O` into
+	// sample[T-O] internally, so any rewrite that removes the offset or moves
+	// the request range silently changes the lookup time.
+	subtreeHasAt := timestampFinder.Found > 0
 
 	// If the tree below us is not all the same offset, then we can't do anything below -- we'll need
 	// to wait until further in execution where they all match
@@ -385,12 +438,30 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 	}
 	offset = offsetFinder.Offset
 
+	// reqOffset is the time-shift applied to downstream request times so that
+	// the engine, after restoring offsets on the synthesized VectorSelector,
+	// looks up samples at the right timestamps. When the subtree has @, the
+	// downstream already resolves @+offset, so we don't shift and the
+	// synthesized node has no offset to re-apply.
+	reqOffset := offset
+	synthOffset := offset
+	if subtreeHasAt {
+		reqOffset = 0
+		synthOffset = 0
+	}
+
 	// Function to recursivelt remove offset. This is needed as we're using
 	// the node API to String() the query to downstreams. Promql's iterators require
 	// that the time be the absolute time, whereas the API returns them based on the
-	// range you ask for (with the offset being implicit)
+	// range you ask for (with the offset being implicit).
+	//
+	// When the subtree has an @ modifier we keep offsets in the string: see
+	// subtreeHasAt comment above.
 	removeOffsetFn := func() error {
-		_, err := parser.Walk(ctx, &OffsetRemover{}, s, node, nil, nil)
+		if subtreeHasAt {
+			return nil
+		}
+		_, err := parser.Walk(ctx, &promclient.OffsetRemover{}, s, node, nil, nil)
 		return err
 	}
 
@@ -399,6 +470,13 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 	// Some AggregateExprs can be composed (meaning they are "reentrant". If the aggregation op
 	// is reentrant/composable then we'll do so, otherwise we let it fall through to normal query mechanisms
 	case *parser.AggregateExpr:
+		// If the vector selector already has the data we can skip
+		if vs, ok := n.Expr.(*parser.VectorSelector); ok {
+			if vs.UnexpandedSeriesSet != nil {
+				return nil, nil
+			}
+		}
+
 		logrus.Debugf("AggregateExpr %v %s", n, n.Op)
 
 		var result model.Value
@@ -413,12 +491,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 			if s.Interval > 0 {
 				result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
-					Start: s.Start.Add(-offset),
-					End:   s.End.Add(-offset),
+					Start: s.Start.Add(-reqOffset),
+					End:   s.End.Add(-reqOffset),
 					Step:  s.Interval,
 				})
 			} else {
-				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-offset))
+				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-reqOffset))
 			}
 
 			if err != nil {
@@ -447,11 +525,11 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 				return &parser.AggregateExpr{
 					Op: parser.MAX,
-					Expr: PreserveLabel(&parser.BinaryExpr{
+					Expr: promclient.PreserveLabel(&parser.BinaryExpr{
 						Op: parser.DIV,
 						LHS: &parser.AggregateExpr{
 							Op:       parser.SUM,
-							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
+							Expr:     promclient.PreserveLabel(promclient.CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
@@ -459,7 +537,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 						RHS: &parser.AggregateExpr{
 							Op:       parser.COUNT,
-							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
+							Expr:     promclient.PreserveLabel(promclient.CloneExpr(n.Expr), model.MetricNameLabel, metricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
@@ -477,7 +555,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 				Op: parser.DIV,
 				LHS: &parser.AggregateExpr{
 					Op:       parser.SUM,
-					Expr:     CloneExpr(n.Expr),
+					Expr:     promclient.CloneExpr(n.Expr),
 					Param:    n.Param,
 					Grouping: n.Grouping,
 					Without:  n.Without,
@@ -485,7 +563,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 				RHS: &parser.AggregateExpr{
 					Op:       parser.COUNT,
-					Expr:     CloneExpr(n.Expr),
+					Expr:     promclient.CloneExpr(n.Expr),
 					Param:    n.Param,
 					Grouping: n.Grouping,
 					Without:  n.Without,
@@ -499,12 +577,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 			if s.Interval > 0 {
 				result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
-					Start: s.Start.Add(-offset),
-					End:   s.End.Add(-offset),
+					Start: s.Start.Add(-reqOffset),
+					End:   s.End.Add(-reqOffset),
 					Step:  s.Interval,
 				})
 			} else {
-				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-offset))
+				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-reqOffset))
 			}
 
 			if err != nil {
@@ -518,12 +596,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 			// First we must fetch the data into a vectorselector
 			if s.Interval > 0 {
 				result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
-					Start: s.Start.Add(-offset),
-					End:   s.End.Add(-offset),
+					Start: s.Start.Add(-reqOffset),
+					End:   s.End.Add(-reqOffset),
 					Step:  s.Interval,
 				})
 			} else {
-				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-offset))
+				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-reqOffset))
 			}
 
 			if err != nil {
@@ -537,7 +615,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 				series[i] = &proxyquerier.Series{iterator}
 			}
 
-			ret := &parser.VectorSelector{OriginalOffset: offset}
+			ret := &parser.VectorSelector{OriginalOffset: synthOffset}
 			if s.Interval > 0 {
 				ret.LookbackDelta = s.Interval - time.Duration(1)
 			}
@@ -575,7 +653,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 				series[i] = &proxyquerier.Series{iterator}
 			}
 
-			ret := &parser.VectorSelector{OriginalOffset: offset}
+			ret := &parser.VectorSelector{OriginalOffset: synthOffset}
 			if s.Interval > 0 {
 				ret.LookbackDelta = s.Interval - time.Duration(1)
 			}
@@ -605,12 +683,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		var err error
 		if s.Interval > 0 {
 			result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
-				Start: s.Start.Add(-offset),
-				End:   s.End.Add(-offset),
+				Start: s.Start.Add(-reqOffset),
+				End:   s.End.Add(-reqOffset),
 				Step:  s.Interval,
 			})
 		} else {
-			result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-offset))
+			result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-reqOffset))
 		}
 
 		if err != nil {
@@ -623,7 +701,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 			series[i] = &proxyquerier.Series{iterator}
 		}
 
-		ret := &parser.VectorSelector{OriginalOffset: offset}
+		ret := &parser.VectorSelector{OriginalOffset: synthOffset}
 		if s.Interval > 0 {
 			ret.LookbackDelta = s.Interval - time.Duration(1)
 		}
@@ -636,7 +714,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		// we can set it as the args (the vector of data) and the promql engine handles the types properly
 		case "scalar":
 			n.Args[0] = ret
-			return nil, nil
+			return n, nil
 		// the functions of sort() and sort_desc() need whole results to calculate.
 		case "sort", "sort_desc":
 			return &parser.Call{
@@ -650,9 +728,6 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 	// If we are simply fetching a Vector then we can fetch the data using the same step that
 	// the query came in as (reducing the amount of data we need to fetch)
 	case *parser.VectorSelector:
-		if n.Timestamp != nil {
-			return nil, nil
-		}
 		// If the vector selector already has the data we can skip
 		if n.UnexpandedSeriesSet != nil {
 			return nil, nil
@@ -676,12 +751,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		if s.Interval > 0 {
 			n.LookbackDelta = s.Interval - time.Duration(1)
 			result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
-				Start: s.Start.Add(-offset),
-				End:   s.End.Add(-offset),
+				Start: s.Start.Add(-reqOffset),
+				End:   s.End.Add(-reqOffset),
 				Step:  s.Interval,
 			})
 		} else {
-			result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-offset))
+			result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-reqOffset))
 		}
 
 		if err != nil {
@@ -693,8 +768,22 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		for i, iterator := range iterators {
 			series[i] = &proxyquerier.Series{iterator}
 		}
+		if n.Timestamp != nil {
+			// Downstream resolved @ T (and any offset) when evaluating
+			// n.String(); the result is step-invariant. Replace with a flat
+			// VectorSelector whose samples sit at the request timestamps so
+			// the engine looks them up by ts directly instead of reapplying
+			// @ T - offset to a sample set that's already pinned.
+			ret := &parser.VectorSelector{OriginalOffset: synthOffset}
+			if s.Interval > 0 {
+				ret.LookbackDelta = s.Interval - time.Duration(1)
+			}
+			ret.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
+			return ret, nil
+		}
 		n.OriginalOffset = offset
 		n.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
+		return n, nil
 
 	// If we hit this someone is asking for a matrix directly, if so then we don't
 	// have anyway to ask for less-- since this is exactly what they are asking for
@@ -709,8 +798,16 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 
 		subEvalStmt := *s
 		subEvalStmt.Expr = n.Expr
-		subEvalStmt.End = subEvalStmt.End.Add(-n.Offset)
-		//subEvalStmt.Start = subEvalStmt.End.Add(-n.Range)
+
+		// If the subquery has an @ modifier its evaluation is pinned to that
+		// timestamp and the outer eval window is irrelevant.
+		var subEnd time.Time
+		if n.Timestamp != nil {
+			subEnd = timestamp.Time(*n.Timestamp).Add(-n.Offset)
+		} else {
+			subEnd = s.End.Add(-n.Offset)
+		}
+		subEvalStmt.End = subEnd
 
 		if n.Step == 0 {
 			subEvalStmt.Interval = time.Duration(p.NoStepSubqueryIntervalFn(durationMilliseconds(n.Range))) * time.Millisecond
@@ -718,8 +815,14 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 			subEvalStmt.Interval = n.Step
 		}
 
-		subEvalStmt.Start = s.Start.Add(-n.Offset).Add(-n.Range).Truncate(subEvalStmt.Interval)
-		if subEvalStmt.Start.Before(s.Start.Add(-n.Offset).Add(-n.Range)) {
+		var subStart time.Time
+		if n.Timestamp != nil {
+			subStart = subEnd.Add(-n.Range)
+		} else {
+			subStart = s.Start.Add(-n.Offset).Add(-n.Range)
+		}
+		subEvalStmt.Start = subStart.Truncate(subEvalStmt.Interval)
+		if subEvalStmt.Start.Before(subStart) {
 			subEvalStmt.Start = subEvalStmt.Start.Add(subEvalStmt.Interval)
 		}
 
@@ -731,6 +834,118 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, nod
 		if newN != nil {
 			n.Expr = newN.(parser.Expr)
 			return n, nil
+		}
+
+	// BinaryExprs *can* be sent untouched to downstreams assuming there is no actual interaction between LHS/RHS
+	// these are relatively rare -- as things like `sum(foo) > 2` would *not* be viable as `sum(foo)` could
+	// potentially require multiple servergroups to generate the correct response.
+	// From inspection there are only 3 specific types where this sort of replacement is "safe" (assuming one side is a literal)
+	// 	`VectorSector`
+	// 	`AggregateExpr` (Max, Min, TopK, BottomK only -- and only if re-combined)
+	case *parser.BinaryExpr:
+		logrus.Debugf("BinaryExpr: %v", n)
+
+		// vectorBinaryExpr will send the node as a query to the downstream and return an expanded VectorSelector
+		vectorBinaryExpr := func(vs *parser.VectorSelector) (parser.Node, error) {
+			logrus.Debugf("BinaryExpr (VectorSelector + Literal): %v", n)
+			removeOffsetFn()
+
+			var result model.Value
+			var warnings v1.Warnings
+			var err error
+			if s.Interval > 0 {
+				vs.LookbackDelta = s.Interval - time.Duration(1)
+				result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
+					Start: s.Start.Add(-reqOffset),
+					End:   s.End.Add(-reqOffset),
+					Step:  s.Interval,
+				})
+			} else {
+				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-reqOffset))
+			}
+
+			if err != nil {
+				return nil, err
+			}
+
+			iterators := promclient.IteratorsForValue(result)
+			series := make([]storage.Series, len(iterators))
+			for i, iterator := range iterators {
+				series[i] = &proxyquerier.Series{iterator}
+			}
+
+			ret := &parser.VectorSelector{OriginalOffset: synthOffset}
+			if s.Interval > 0 {
+				ret.LookbackDelta = s.Interval - time.Duration(1)
+			}
+			ret.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
+			return ret, nil
+		}
+
+		// aggregateBinaryExpr will send the node as a query to the downstream and
+		// replace the aggregate expr with the resulting data. This will cause the aggregation
+		// (min, max, topk, bottomk) to be re-run against the expression.
+		aggregateBinaryExpr := func(agg *parser.AggregateExpr) (parser.Node, error) {
+			logrus.Debugf("BinaryExpr (AggregateExpr + Literal): %v", n)
+
+			removeOffsetFn()
+
+			var (
+				result   model.Value
+				warnings v1.Warnings
+				err      error
+			)
+
+			if s.Interval > 0 {
+				result, warnings, err = state.client.QueryRange(ctx, n.String(), v1.Range{
+					Start: s.Start.Add(-reqOffset),
+					End:   s.End.Add(-reqOffset),
+					Step:  s.Interval,
+				})
+			} else {
+				result, warnings, err = state.client.Query(ctx, n.String(), s.Start.Add(-reqOffset))
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			iterators := promclient.IteratorsForValue(result)
+
+			series := make([]storage.Series, len(iterators))
+			for i, iterator := range iterators {
+				series[i] = &proxyquerier.Series{iterator}
+			}
+
+			ret := &parser.VectorSelector{OriginalOffset: synthOffset}
+			if s.Interval > 0 {
+				ret.LookbackDelta = s.Interval - time.Duration(1)
+			}
+			ret.UnexpandedSeriesSet = proxyquerier.NewSeriesSet(series, promhttputil.WarningsConvert(warnings), err)
+
+			agg.Expr = ret
+			return agg, nil
+		}
+
+		// Only valid if the other side is either `NumberLiteral` or `StringLiteral`
+		this := n.LHS
+		other := n.RHS
+		literal := promclient.ExprIsLiteral(promclient.UnwrapExpr(this))
+		if !literal {
+			this = n.RHS
+			other = n.LHS
+			literal = promclient.ExprIsLiteral(promclient.UnwrapExpr(this))
+		}
+		// If one side is a literal lets check
+		if literal {
+			switch otherTyped := other.(type) {
+			case *parser.VectorSelector:
+				return vectorBinaryExpr(otherTyped)
+			case *parser.AggregateExpr:
+				switch otherTyped.Op {
+				case parser.MIN, parser.MAX, parser.TOPK, parser.BOTTOMK:
+					return aggregateBinaryExpr(otherTyped)
+				}
+			}
 		}
 
 	default:

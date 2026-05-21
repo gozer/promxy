@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/api"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage/remote"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/jacksontj/promxy/pkg/promhttputil"
 )
@@ -25,9 +28,17 @@ var (
 )
 
 // PromAPIV1 implements our internal API interface using *only* the v1 HTTP API
-// Simply wraps the prom API to fullfil our internal API interface
+// Simply wraps the prom API to fullfil our internal API interface.
+//
+// Client is the underlying api.Client used for Query / QueryRange. It is set
+// when a PromAPIV1 is constructed against a real downstream so that we can
+// parse the `infos` field of the JSON response (which client_golang's v1
+// package drops). Query / QueryRange fall back to the embedded v1.API if
+// Client is nil — that path is used by tests that supply a stub v1.API
+// directly.
 type PromAPIV1 struct {
 	v1.API
+	Client api.Client
 }
 
 // LabelNames returns all the unique label names present in the block in sorted order.
@@ -58,12 +69,41 @@ func (p *PromAPIV1) LabelValues(ctx context.Context, label string, matchers []st
 
 // Query performs a query for the given time.
 func (p *PromAPIV1) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
-	return p.API.Query(ctx, query, ts)
+	if hasNegativeFractionalSecond(ts) {
+		return nil, nil, errNegativeFractionalTimestamp
+	}
+	if p.Client == nil {
+		return p.API.Query(ctx, query, ts)
+	}
+	u := p.Client.URL(epQuery, nil)
+	q := u.Query()
+	q.Set("query", query)
+	if !ts.IsZero() {
+		q.Set("time", formatAPITime(ts))
+	}
+	return queryWithInfos(ctx, p.Client, u, q)
 }
 
 // QueryRange performs a query for the given range.
 func (p *PromAPIV1) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
-	return p.API.QueryRange(ctx, query, r)
+	// Reject ranges whose first eval step would land on a pre-epoch
+	// sub-second timestamp; the upstream JSON decoder mis-parses these.
+	// See hasNegativeFractionalSecond. Step times are start + k*step, so
+	// checking start covers the whole range when step is whole-second
+	// (the only thing PromQL produces here).
+	if hasNegativeFractionalSecond(r.Start) {
+		return nil, nil, errNegativeFractionalTimestamp
+	}
+	if p.Client == nil {
+		return p.API.QueryRange(ctx, query, r)
+	}
+	u := p.Client.URL(epQueryRange, nil)
+	q := u.Query()
+	q.Set("query", query)
+	q.Set("start", formatAPITime(r.Start))
+	q.Set("end", formatAPITime(r.End))
+	q.Set("step", strconv.FormatFloat(r.Step.Seconds(), 'f', -1, 64))
+	return queryWithInfos(ctx, p.Client, u, q)
 }
 
 // Series finds series by label matchers.
@@ -108,32 +148,53 @@ func (p *PromAPIRemoteRead) GetValue(ctx context.Context, start, end time.Time, 
 	if err != nil {
 		return nil, nil, err
 	}
-	result, err := p.ReadClient.Read(ctx, query)
+	ss, err := p.ReadClient.Read(ctx, query, false)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// convert result (timeseries) to SampleStream
-	matrix := make(model.Matrix, len(result.Timeseries))
-	for i, ts := range result.Timeseries {
-		metric := make(model.Metric)
-		for _, label := range ts.Labels {
-			metric[model.LabelName(label.Name)] = model.LabelValue(label.Value)
-		}
+	// Convert the SeriesSet to a model.Matrix.
+	matrix := make(model.Matrix, 0)
+	for ss.Next() {
+		s := ss.At()
 
-		samples := make([]model.SamplePair, len(ts.Samples))
-		for x, sample := range ts.Samples {
-			samples[x] = model.SamplePair{
-				Timestamp: model.Time(sample.Timestamp),
-				Value:     model.SampleValue(sample.Value),
+		metric := make(model.Metric)
+		s.Labels().Range(func(label labels.Label) {
+			metric[model.LabelName(label.Name)] = model.LabelValue(label.Value)
+		})
+
+		samples := []model.SamplePair{}
+		var histograms []model.SampleHistogramPair
+		it := s.Iterator(nil)
+		for vt := it.Next(); vt != chunkenc.ValNone; vt = it.Next() {
+			switch vt {
+			case chunkenc.ValFloat:
+				t, v := it.At()
+				samples = append(samples, model.SamplePair{
+					Timestamp: model.Time(t),
+					Value:     model.SampleValue(v),
+				})
+			case chunkenc.ValHistogram, chunkenc.ValFloatHistogram:
+				t, fh := it.AtFloatHistogram(nil)
+				histograms = append(histograms, model.SampleHistogramPair{
+					Timestamp: model.Time(t),
+					Histogram: floatHistogramToSampleHistogram(fh),
+				})
 			}
 		}
-
-		matrix[i] = &model.SampleStream{
-			Metric: metric,
-			Values: samples,
+		if err := it.Err(); err != nil {
+			return nil, nil, err
 		}
+
+		matrix = append(matrix, &model.SampleStream{
+			Metric:     metric,
+			Values:     samples,
+			Histograms: histograms,
+		})
 	}
 
+	if err := ss.Err(); err != nil {
+		return nil, nil, err
+	}
 	return matrix, nil, nil
 }

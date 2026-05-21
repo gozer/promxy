@@ -18,16 +18,15 @@ import (
 
 	_ "net/http/pprof"
 
-	kitlog "github.com/go-kit/kit/log"
 	"github.com/golang/glog"
 	"github.com/grafana/regexp"
 	"github.com/jessevdk/go-flags"
 	"github.com/julienschmidt/httprouter"
 	"github.com/prometheus/client_golang/prometheus"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
@@ -38,6 +37,7 @@ import (
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
+	promlogging "github.com/prometheus/prometheus/util/logging"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/prometheus/prometheus/web"
 	"github.com/sirupsen/logrus"
@@ -69,7 +69,7 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(version.NewCollector("promxy"))
+	prometheus.MustRegister(versioncollector.NewCollector("promxy"))
 }
 
 type cliOpts struct {
@@ -82,7 +82,7 @@ type cliOpts struct {
 	LogFormat        string `long:"log-format" description:"Log format(text|json)" default:"text"`
 	LogMaxFormPrefix int    `long:"log-max-form-prefix" description:"Max prefix for form values in log entries" default:"256"`
 
-	WebConfigFile      string        `long:"web.config.file" description:"[EXPERIMENTAL] Path to configuration file that can enable TLS or authentication."`
+	WebConfigFile      string        `long:"web.config.file" description:"[EXPERIMENTAL] Path to a Prometheus-format web config file (TLS, HTTP headers, basic auth users). See https://prometheus.io/docs/prometheus/latest/configuration/https/ for the schema."`
 	WebCORSOriginRegex string        `long:"web.cors.origin" description:"Regex for CORS origin. It is fully anchored." default:".*"`
 	WebReadTimeout     time.Duration `long:"web.read-timeout" description:"Maximum duration before timing out read of the request, and closing idle connections." default:"5m"`
 
@@ -90,13 +90,15 @@ type cliOpts struct {
 	ProxyHeaders []string `long:"proxy-headers" env:"PROXY_HEADERS" description:"a list of headers to proxy to downstream servergroups."`
 
 	ExternalURL     string `long:"web.external-url" description:"The URL under which Prometheus is externally reachable (for example, if Prometheus is served via a reverse proxy). Used for generating relative and absolute links back to Prometheus itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Prometheus. If omitted, relevant URL components will be derived automatically."`
+	RoutePrefix     string `long:"web.route-prefix" description:"Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url."`
 	EnableLifecycle bool   `long:"web.enable-lifecycle" description:"Enable shutdown and reload via HTTP request."`
 
 	QueryTimeout        time.Duration `long:"query.timeout" description:"Maximum time a query may take before being aborted." default:"2m"`
 	QueryMaxSamples     int           `long:"query.max-samples" description:"Maximum number of samples a single query can load into memory. Note that queries will fail if they would load more samples than this into memory, so this also limits the number of samples a query can return." default:"50000000"`
 	QueryLookbackDelta  time.Duration `long:"query.lookback-delta" description:"The maximum lookback duration for retrieving metrics during expression evaluations." default:"5m"`
 	QueryMaxConcurrency int           `long:"query.max-concurrency" default:"-1" description:"Maximum number of queries executed concurrently."`
-	LocalStoragePath    string        `long:"storage.tsdb.path" description:"Base path for metrics storage."`
+	StoragePath         string        `long:"storage.path" description:"Base directory for promxy's local working state (active query tracker file, remote_write WAL)."`
+	LegacyStoragePath   string        `long:"storage.tsdb.path" description:"DEPRECATED: use --storage.path instead. (Promxy has no TSDB; this flag is misnamed.)"`
 
 	RemoteReadMaxConcurrency int `long:"remote-read.max-concurrency" description:"Maximum number of concurrent remote read calls." default:"10"`
 
@@ -177,6 +179,14 @@ func main() {
 		os.Exit(0)
 	}
 
+	if opts.LegacyStoragePath != "" {
+		if opts.StoragePath != "" {
+			logrus.Fatalf("--storage.tsdb.path and --storage.path are mutually exclusive; --storage.tsdb.path is deprecated, use --storage.path")
+		}
+		logrus.Warnf("--storage.tsdb.path is deprecated; use --storage.path instead")
+		opts.StoragePath = opts.LegacyStoragePath
+	}
+
 	// CheckConfig simply will load the config, check for errors, and exit
 	if opts.CheckConfig {
 		if _, err := proxyconfig.ConfigFromFile(opts.ConfigFile); err != nil {
@@ -210,11 +220,11 @@ func main() {
 
 	// Above level 6, the k8s client would log bearer tokens in clear-text.
 	glog.ClampLevel(6)
-	glog.SetLogger(logging.NewLogger(logrus.WithField("component", "k8s_client_runtime").Logger))
+	glog.SetLogger(logging.NewGoKitLogger(logrus.WithField("component", "k8s_client_runtime")))
 
 	// Above level 6, the k8s client would log bearer tokens in clear-text.
 	klog.ClampLevel(6)
-	klog.SetLogger(logging.NewLogger(logrus.WithField("component", "k8s_client_runtime").Logger))
+	klog.SetLogger(logging.NewGoKitLogger(logrus.WithField("component", "k8s_client_runtime")))
 
 	// Create base context for this daemon
 	ctx, cancel := context.WithCancel(context.Background())
@@ -229,22 +239,19 @@ func main() {
 	// Create the proxy storage
 	var proxyStorage storage.Storage
 
-	ps, err := proxystorage.NewProxyStorage(noStepSubqueryInterval.Get)
+	ps, err := proxystorage.NewProxyStorage(noStepSubqueryInterval.Get, opts.StoragePath)
 	if err != nil {
 		logrus.Fatalf("Error creating proxy: %v", err)
 	}
 	reloadables = append(reloadables, ps)
 	proxyStorage = ps
 
-	logCfg := &promlog.Config{
-		Level:  &promlog.AllowedLevel{},
-		Format: &promlog.AllowedFormat{},
-	}
-	if err := logCfg.Level.Set("info"); err != nil {
-		logrus.Fatalf("Unable to set log level: %v", err)
-	}
-
-	logger := promlog.New(logCfg)
+	// All prometheus libraries (notifier, scrape, web, discovery,
+	// promql.NewActiveQueryTracker) take an *slog.Logger. Bridge those
+	// through logrus so promxy's user-facing logging configuration
+	// (level, format, fields) governs both promxy's own output and the
+	// embedded prometheus-library output.
+	logger := logging.NewLogger(logrus.StandardLogger())
 
 	engineOpts := promql.EngineOpts{
 		Reg:                      prometheus.DefaultRegisterer,
@@ -260,10 +267,10 @@ func main() {
 	}
 
 	if opts.QueryMaxConcurrency != -1 {
-		if opts.LocalStoragePath == "" {
-			logrus.Fatalf("local storage path must be defined if you wish to enable max query concurrency limits")
+		if opts.StoragePath == "" {
+			logrus.Fatalf("--storage.path must be set if you wish to enable max query concurrency limits")
 		}
-		engineOpts.ActiveQueryTracker = promql.NewActiveQueryTracker(opts.LocalStoragePath, opts.QueryMaxConcurrency, kitlog.With(logger, "component", "activeQueryTracker"))
+		engineOpts.ActiveQueryTracker = promql.NewActiveQueryTracker(opts.StoragePath, opts.QueryMaxConcurrency, logger.With("component", "activeQueryTracker"))
 	}
 
 	engine := promql.NewEngine(engineOpts)
@@ -280,11 +287,18 @@ func main() {
 			Registerer:    prometheus.DefaultRegisterer,
 			QueueCapacity: opts.NotificationQueueCapacity,
 		},
-		kitlog.With(logger, "component", "notifier"),
+		logger.With("component", "notifier"),
 	)
 	reloadables = append(reloadables, proxyconfig.WrapPromReloadable(notifierManager))
 
-	discoveryManagerNotify := discovery.NewManager(ctx, kitlog.With(logger, "component", "discovery manager notify"))
+	notifyDiscoverySDMetrics, err := discovery.RegisterSDMetrics(prometheus.DefaultRegisterer, discovery.NewRefreshMetrics(prometheus.DefaultRegisterer))
+	if err != nil {
+		logrus.Fatalf("Error registering SD metrics: %v", err)
+	}
+	discoveryManagerNotify := discovery.NewManager(ctx, logger.With("component", "discovery manager notify"), prometheus.DefaultRegisterer, notifyDiscoverySDMetrics)
+	if discoveryManagerNotify == nil {
+		logrus.Fatalf("Error creating notify discovery manager")
+	}
 
 	reloadables = append(reloadables,
 		proxyconfig.WrapPromReloadable(&proxyconfig.ApplyConfigFunc{func(cfg *config.Config) error {
@@ -368,8 +382,27 @@ func main() {
 		return nil
 	}}))
 
+	// PromQL query engine reloadable
+	reloadables = append(reloadables, proxyconfig.WrapPromReloadable(&proxyconfig.ApplyConfigFunc{func(cfg *config.Config) error {
+		if cfg.GlobalConfig.QueryLogFile == "" {
+			engine.SetQueryLogger(nil)
+			return nil
+		}
+
+		l, err := promlogging.NewJSONFileLogger(cfg.GlobalConfig.QueryLogFile)
+		if err != nil {
+			return err
+		}
+		engine.SetQueryLogger(l)
+
+		return nil
+	}}))
+
 	// We need an empty scrape manager, simply to make the API not panic and error out
-	scrapeManager := scrape.NewManager(nil, kitlog.With(logger, "component", "scrape manager"), nil)
+	scrapeManager, err := scrape.NewManager(nil, logger.With("component", "scrape manager"), nil, nil, prometheus.DefaultRegisterer)
+	if err != nil {
+		logrus.Fatalf("Error creating scrape manager: %v", err)
+	}
 
 	webOptions := &web.Options{
 		Registerer:      prometheus.DefaultRegisterer,
@@ -388,8 +421,14 @@ func main() {
 
 		EnableLifecycle: opts.EnableLifecycle,
 
+		// Prometheus' web.New() indexes ListenAddresses[0] unconditionally when
+		// constructing GlobalURLOptions; promxy doesn't use the embedded
+		// listeners (it has its own server), but the slice still must be set
+		// or startup panics.
+		ListenAddresses: []string{opts.BindAddr},
+
 		Flags:       opts.ToFlags(),
-		RoutePrefix: "/",
+		RoutePrefix: opts.RoutePrefix,
 		ExternalURL: externalUrl,
 		Version: &web.PrometheusVersion{
 			Version:   version.Version,
@@ -406,13 +445,16 @@ func main() {
 		logrus.Fatalf("Error parsing CORS regex: %v", err)
 	}
 
-	if externalUrl != nil && externalUrl.Path != "" {
+	// Default -web.route-prefix to path of -web.external-url.
+	if webOptions.RoutePrefix == "" {
 		webOptions.RoutePrefix = externalUrl.Path
 	}
+	// RoutePrefix must always be at least '/'.
+	webOptions.RoutePrefix = "/" + strings.Trim(webOptions.RoutePrefix, "/")
 
 	webHandler := web.New(logger, webOptions)
 	reloadables = append(reloadables, proxyconfig.WrapPromReloadable(webHandler))
-	webHandler.SetReady(true)
+	webHandler.SetReady(web.Ready)
 
 	apiPrefix := path.Join(webOptions.RoutePrefix, "/api/v1")
 	// Register API endpoint with correct route prefix
@@ -427,7 +469,7 @@ func main() {
 	r.NotFound = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Have our fallback rules
 		if strings.HasPrefix(r.URL.Path, path.Join(webOptions.RoutePrefix, "/debug")) {
-			http.StripPrefix(webOptions.RoutePrefix, http.DefaultServeMux).ServeHTTP(w, r)
+			http.StripPrefix(strings.Trim(webOptions.RoutePrefix, "/"), http.DefaultServeMux).ServeHTTP(w, r)
 		} else if r.URL.Path == path.Join(webOptions.RoutePrefix, "/-/ready") {
 			if stopping {
 				w.WriteHeader(http.StatusServiceUnavailable)
