@@ -7,6 +7,7 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 )
 
 // AbsoluteTimeFilter will filter queries out (return nil,nil) for all queries outside the given times
@@ -53,23 +54,28 @@ func (tf *AbsoluteTimeFilter) LabelValues(ctx context.Context, label string, mat
 }
 
 // Query performs a query for the given time.
-func (tf *AbsoluteTimeFilter) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (tf *AbsoluteTimeFilter) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	if (!tf.Start.IsZero() && ts.Before(tf.Start)) || (!tf.End.IsZero() && ts.After(tf.End)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	return tf.API.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (tf *AbsoluteTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (tf *AbsoluteTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	if (!tf.Start.IsZero() && r.End.Before(tf.Start)) || (!tf.End.IsZero() && r.Start.After(tf.End)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
 		if !tf.Start.IsZero() && r.Start.Before(tf.Start) {
-			r.Start = tf.Start
+			remainder := tf.Start.Sub(r.Start) % r.Step
+			if remainder > 0 {
+				r.Start = tf.Start.Add(r.Step - remainder)
+			} else {
+				r.Start = tf.Start
+			}
 		}
 		if !tf.End.IsZero() && r.End.After(tf.End) {
 			r.End = tf.End
@@ -98,9 +104,9 @@ func (tf *AbsoluteTimeFilter) Series(ctx context.Context, matches []string, star
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (tf *AbsoluteTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (tf *AbsoluteTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	if (!tf.Start.IsZero() && end.Before(tf.Start)) || (!tf.End.IsZero() && start.After(tf.End)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
@@ -113,6 +119,24 @@ func (tf *AbsoluteTimeFilter) GetValue(ctx context.Context, start, end time.Time
 	}
 
 	return tf.API.GetValue(ctx, start, end, matchers)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (tf *AbsoluteTimeFilter) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	if (!tf.Start.IsZero() && endTime.Before(tf.Start)) || (!tf.End.IsZero() && startTime.After(tf.End)) {
+		return nil, nil
+	}
+
+	if tf.Truncate {
+		if !tf.Start.IsZero() && startTime.Before(tf.Start) {
+			startTime = tf.Start
+		}
+		if !tf.End.IsZero() && endTime.After(tf.End) {
+			endTime = tf.End
+		}
+	}
+
+	return tf.API.QueryExemplars(ctx, query, startTime, endTime)
 }
 
 // RelativeTimeFilter will filter queries out (return nil,nil) for all queries outside the given durations relative to time.Now()
@@ -175,25 +199,30 @@ func (tf *RelativeTimeFilter) LabelValues(ctx context.Context, label string, mat
 }
 
 // Query performs a query for the given time.
-func (tf *RelativeTimeFilter) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (tf *RelativeTimeFilter) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	tfStart, tfEnd := tf.window()
 	if (!tfStart.IsZero() && ts.Before(tfStart)) || (!tfEnd.IsZero() && ts.After(tfEnd)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	return tf.API.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (tf *RelativeTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (tf *RelativeTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	tfStart, tfEnd := tf.window()
 	if (!tfStart.IsZero() && r.End.Before(tfStart)) || (!tfEnd.IsZero() && r.Start.After(tfEnd)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
 		if !tfStart.IsZero() && r.Start.Before(tfStart) {
-			r.Start = tfStart
+			remainder := tfStart.Sub(r.Start) % r.Step
+			if remainder > 0 {
+				r.Start = tfStart.Add(r.Step - remainder)
+			} else {
+				r.Start = tfStart
+			}
 		}
 		if !tfEnd.IsZero() && r.End.After(tfEnd) {
 			r.End = tfEnd
@@ -223,10 +252,10 @@ func (tf *RelativeTimeFilter) Series(ctx context.Context, matches []string, star
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (tf *RelativeTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (tf *RelativeTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	tfStart, tfEnd := tf.window()
 	if (!tfStart.IsZero() && end.Before(tfStart)) || (!tfEnd.IsZero() && start.After(tfEnd)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
@@ -239,4 +268,23 @@ func (tf *RelativeTimeFilter) GetValue(ctx context.Context, start, end time.Time
 	}
 
 	return tf.API.GetValue(ctx, start, end, matchers)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (tf *RelativeTimeFilter) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	tfStart, tfEnd := tf.window()
+	if (!tfStart.IsZero() && endTime.Before(tfStart)) || (!tfEnd.IsZero() && startTime.After(tfEnd)) {
+		return nil, nil
+	}
+
+	if tf.Truncate {
+		if !tfStart.IsZero() && startTime.Before(tfStart) {
+			startTime = tfStart
+		}
+		if !tfEnd.IsZero() && endTime.Before(tfEnd) {
+			endTime = tfEnd
+		}
+	}
+
+	return tf.API.QueryExemplars(ctx, query, startTime, endTime)
 }

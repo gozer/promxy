@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="promxy" width="500">
+</p>
+
 # Promxy [![Test Actions Status](https://github.com/jacksontj/promxy/workflows/Go/badge.svg)](https://github.com/jacksontj/promxy/actions) [![GoDoc](https://godoc.org/github.com/jacksontj/promxy?status.svg)](https://godoc.org/github.com/jacksontj/promxy) [![Go Report Card](https://goreportcard.com/badge/github.com/jacksontj/promxy)](https://goreportcard.com/report/github.com/jacksontj/promxy) ![build](https://github.com/jacksontj/promxy/workflows/build/badge.svg) [![Docker Repository on Quay](https://quay.io/repository/jacksontj/promxy/status "Docker Repository on Quay")](https://quay.io/repository/jacksontj/promxy)
 
 pronounced "promski" or präm-sē
@@ -29,7 +33,7 @@ If you are interested in hacking on promxy (or just running your own build), you
 
 ```
 git clone git@github.com:jacksontj/promxy.git
-cd promxy/cmd/promxy && go build
+cd promxy/cmd/promxy && go build -mod=vendor -tags netgo,builtinassets
 ```
 
 An example configuration file is available in the [repo](https://github.com/jacksontj/promxy/blob/master/cmd/promxy/config.yaml).

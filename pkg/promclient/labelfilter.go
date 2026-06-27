@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/sirupsen/logrus"
 )
 
@@ -191,40 +192,40 @@ func (c *LabelFilterClient) Sync(ctx context.Context) error {
 }
 
 // Query performs a query for the given time.
-func (c *LabelFilterClient) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (c *LabelFilterClient) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	// Parse out the promql query into expressions etc.
 	e, err := parser.ParseExpr(query)
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 
 	filterVisitor := NewFilterLabelVisitor(c.LabelFilter())
 	if _, err := parser.Walk(ctx, filterVisitor, &parser.EvalStmt{Expr: e}, e, nil, nil); err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 	if !filterVisitor.filterMatch {
 		filteredCount.WithLabelValues("Query").Inc()
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	return c.API.Query(ctx, query, ts)
 }
 
-// Query performs a query for the given time.
-func (c *LabelFilterClient) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+// QueryRange performs a query for the given range.
+func (c *LabelFilterClient) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	// Parse out the promql query into expressions etc.
 	e, err := parser.ParseExpr(query)
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 
 	filterVisitor := NewFilterLabelVisitor(c.LabelFilter())
 	if _, err := parser.Walk(ctx, filterVisitor, &parser.EvalStmt{Expr: e}, e, nil, nil); err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 	if !filterVisitor.filterMatch {
 		filteredCount.WithLabelValues("QueryRange").Inc()
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	return c.API.QueryRange(ctx, query, r)
@@ -249,12 +250,12 @@ func (c *LabelFilterClient) Series(ctx context.Context, matches []string, startT
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (c *LabelFilterClient) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (c *LabelFilterClient) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	// check if the matcher is excluded by our filter
 	for _, matcher := range matchers {
 		if !FilterLabelMatchers(c.LabelFilter(), matcher) {
 			filteredCount.WithLabelValues("GetValue").Inc()
-			return nil, nil, nil
+			return storage.EmptySeriesSet()
 		}
 	}
 	return c.API.GetValue(ctx, start, end, matchers)
@@ -271,6 +272,40 @@ func (c *LabelFilterClient) Metadata(ctx context.Context, metric, limit string) 
 		return nil, nil
 	}
 	return c.API.Metadata(ctx, metric, limit)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+// Mirrors the matcher-filter logic used by Series / GetValue: parse the
+// query, extract every vector selector, and skip the downstream call when
+// every selector references labels this server-group can't satisfy. A
+// query that mixes a satisfiable selector with a non-satisfiable one is
+// still forwarded (we can't easily rewrite a PromQL string) — the
+// non-satisfiable side just returns no exemplars.
+func (c *LabelFilterClient) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	expr, err := parser.ParseExpr(query)
+	if err != nil {
+		// Parse error: let the downstream return the canonical error rather
+		// than swallowing it here.
+		return c.API.QueryExemplars(ctx, query, startTime, endTime)
+	}
+	selectors := parser.ExtractSelectors(expr)
+	if len(selectors) == 0 {
+		return c.API.QueryExemplars(ctx, query, startTime, endTime)
+	}
+	for _, ms := range selectors {
+		ok := true
+		for _, matcher := range ms {
+			if !FilterLabelMatchers(c.LabelFilter(), matcher) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return c.API.QueryExemplars(ctx, query, startTime, endTime)
+		}
+	}
+	filteredCount.WithLabelValues("QueryExemplars").Inc()
+	return nil, nil
 }
 
 func NewFilterLabelVisitor(filter map[string]map[string]struct{}) *FilterLabelVisitor {

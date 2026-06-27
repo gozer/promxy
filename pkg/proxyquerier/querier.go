@@ -4,11 +4,10 @@ import (
 	"context"
 	"time"
 
-	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
-	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/sirupsen/logrus"
 
 	proxyconfig "github.com/jacksontj/promxy/pkg/config"
@@ -18,7 +17,6 @@ import (
 
 // ProxyQuerier Implements prometheus' Querier interface
 type ProxyQuerier struct {
-	Ctx    context.Context
 	Start  time.Time
 	End    time.Time
 	Client promclient.API
@@ -28,7 +26,7 @@ type ProxyQuerier struct {
 
 // Select returns a set of series that matches the given label matchers.
 // TODO: switch based on sortSeries bool(first arg)
-func (h *ProxyQuerier) Select(_ bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+func (h *ProxyQuerier) Select(ctx context.Context, _ bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	start := time.Now()
 	defer func() {
 		logrus.WithFields(logrus.Fields{
@@ -38,9 +36,6 @@ func (h *ProxyQuerier) Select(_ bool, hints *storage.SelectHints, matchers ...*l
 		}).Debug("Select")
 	}()
 
-	var result model.Value
-	var warnings storage.Warnings
-	var err error
 	// Select() is a combined API call for query/query_range/series.
 	// as of right now there is no great way of differentiating between a
 	// data call (query/query_range) and a metadata call (series). For now
@@ -49,43 +44,33 @@ func (h *ProxyQuerier) Select(_ bool, hints *storage.SelectHints, matchers ...*l
 	if hints == nil || hints.Func == "series" {
 		matcherString, err := promhttputil.MatcherToString(matchers)
 		if err != nil {
-			return NewSeriesSet(nil, nil, err)
+			return storage.ErrSeriesSet(err)
 		}
-		labelsets, w, err := h.Client.Series(h.Ctx, []string{matcherString}, h.Start, h.End)
-		warnings = promhttputil.WarningsConvert(w)
+		labelsets, w, err := h.Client.Series(ctx, []string{matcherString}, h.Start, h.End)
+		warnings := promhttputil.WarningsConvert(w)
 		if err != nil {
 			return NewSeriesSet(nil, warnings, err)
 		}
-		// Convert labelsets to vectors
-		// convert to vector (there aren't points, but this way we don't have to make more merging functions)
-		retVector := make(model.Vector, len(labelsets))
+		// series metadata: label sets with no samples
+		series := make([]storage.Series, len(labelsets))
 		for j, labelset := range labelsets {
-			retVector[j] = &model.Sample{
-				Metric: model.Metric(labelset),
+			lb := labels.NewScratchBuilder(len(labelset))
+			for k, v := range labelset {
+				lb.Add(string(k), string(v))
 			}
+			lb.Sort()
+			series[j] = storage.NewListSeries(lb.Labels(), nil)
 		}
-		result = retVector
-	} else {
-		var w v1.Warnings
-		result, w, err = h.Client.GetValue(h.Ctx, timestamp.Time(hints.Start), timestamp.Time(hints.End), matchers)
-		warnings = promhttputil.WarningsConvert(w)
-	}
-	if err != nil {
-		return NewSeriesSet(nil, warnings, err)
+		return NewSeriesSet(series, warnings, nil)
 	}
 
-	iterators := promclient.IteratorsForValue(result)
-
-	series := make([]storage.Series, len(iterators))
-	for i, iterator := range iterators {
-		series[i] = &Series{iterator}
-	}
-
-	return NewSeriesSet(series, warnings, nil)
+	// Data path: the client already returns a storage.SeriesSet, decoded
+	// straight from the downstream response (no model.Value round-trip).
+	return h.Client.GetValue(ctx, timestamp.Time(hints.Start), timestamp.Time(hints.End), matchers)
 }
 
 // LabelValues returns all potential values for a label name.
-func (h *ProxyQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (h *ProxyQuerier) LabelValues(ctx context.Context, name string, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	start := time.Now()
 	defer func() {
 		logrus.WithFields(logrus.Fields{
@@ -104,7 +89,7 @@ func (h *ProxyQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]
 		matchersStrings = []string{s}
 	}
 
-	result, w, err := h.Client.LabelValues(h.Ctx, name, matchersStrings, h.Start, h.End)
+	result, w, err := h.Client.LabelValues(ctx, name, matchersStrings, h.Start, h.End)
 	warnings := promhttputil.WarningsConvert(w)
 	if err != nil {
 		return nil, warnings, err
@@ -119,7 +104,7 @@ func (h *ProxyQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]
 }
 
 // LabelNames returns all the unique label names present in the block in sorted order.
-func (h *ProxyQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (h *ProxyQuerier) LabelNames(ctx context.Context, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	start := time.Now()
 	defer func() {
 		logrus.WithFields(logrus.Fields{
@@ -136,7 +121,7 @@ func (h *ProxyQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storag
 		matchersStrings = []string{s}
 	}
 
-	v, w, err := h.Client.LabelNames(h.Ctx, matchersStrings, h.Start, h.End)
+	v, w, err := h.Client.LabelNames(ctx, matchersStrings, h.Start, h.End)
 	return v, promhttputil.WarningsConvert(w), err
 }
 

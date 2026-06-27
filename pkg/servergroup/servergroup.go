@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -17,14 +18,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promlog"
+	prom_config "github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/storage/remote"
+	"github.com/prometheus/sigv4"
 	"github.com/sirupsen/logrus"
 
+	"github.com/jacksontj/promxy/pkg/logging"
 	"github.com/jacksontj/promxy/pkg/middleware"
 	"github.com/jacksontj/promxy/pkg/promclient"
 	//	sd_config "github.com/prometheus/prometheus/discovery/config"
@@ -36,10 +40,20 @@ var (
 		Name: "server_group_request_duration_seconds",
 		Help: "Summary of calls to servergroup instances",
 	}, []string{"host", "call", "status"})
+
+	// serverGroupTargets tracks the number of targets currently discovered for
+	// each server group, so a zero-target group can be alerted on (e.g.
+	// `server_group_targets == 0`). The ordinal is guaranteed unique; the name
+	// label is the optional, human-readable group name (empty when unset).
+	serverGroupTargets = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "server_group_targets",
+		Help: "Number of targets currently discovered for a server group.",
+	}, []string{"ordinal", "name"})
 )
 
 func init() {
 	prometheus.MustRegister(serverGroupSummary)
+	prometheus.MustRegister(serverGroupTargets)
 }
 
 // New creates a new servergroup
@@ -52,14 +66,17 @@ func NewServerGroup() (*ServerGroup, error) {
 		Ready:     make(chan struct{}),
 	}
 
-	logCfg := &promlog.Config{
-		Level:  &promlog.AllowedLevel{},
-		Format: &promlog.AllowedFormat{},
-	}
-	if err := logCfg.Level.Set("info"); err != nil {
+	// TODO: route SD metrics into the global registry. We use a fresh registry
+	// here to avoid double-registration when multiple servergroups exist.
+	sdMetrics, err := discovery.RegisterSDMetrics(prometheus.NewRegistry(), discovery.NewRefreshMetrics(prometheus.NewRegistry()))
+	if err != nil {
 		return nil, err
 	}
-	sg.targetManager = discovery.NewManager(ctx, promlog.New(logCfg))
+	sdLogger := logging.NewLogger(logrus.WithField("component", "servergroup-discovery"))
+	sg.targetManager = discovery.NewManager(ctx, sdLogger, prometheus.NewRegistry(), sdMetrics)
+	if sg.targetManager == nil {
+		return nil, fmt.Errorf("failed to create discovery manager")
+	}
 	// Background the updating
 	go sg.targetManager.Run()
 	go sg.Sync()
@@ -94,6 +111,58 @@ type ServerGroup struct {
 	OriginalURLs []string
 
 	state atomic.Value
+
+	// histogramCache backs IsHistogramMetric. The background refresh loop is
+	// only started when Cfg.HistogramMetadataRefresh > 0; when zero, the
+	// cache stays empty and IsHistogramMetric always returns false (AST-only
+	// routing). See pkg/servergroup/histogram_cache.go.
+	histogramCache histogramMetadataCache
+}
+
+// IsHistogramMetric reports whether the given metric name is known to be a
+// histogram metric in this server group's most recent metadata snapshot.
+// Returns false when the metadata cache is disabled (the default), when no
+// fetch has succeeded yet, or when the name simply isn't a histogram.
+//
+// Used by the proxy-level histogram routing decision to disable HTTP-API
+// pushdown for queries that touch histogram metrics, even when the query
+// doesn't invoke one of the histogram-only PromQL functions.
+func (s *ServerGroup) IsHistogramMetric(name string) bool {
+	return s.histogramCache.Contains(name)
+}
+
+// groupIdentifier returns a human-readable identifier for this server group for
+// use in logs. The ordinal is always included (it is guaranteed unique); the
+// optional, non-unique name is appended when set.
+func (s *ServerGroup) groupIdentifier() string {
+	if s.Cfg == nil {
+		return "unknown"
+	}
+	if s.Cfg.Name != "" {
+		return fmt.Sprintf("ord=%d name=%s", s.Cfg.Ordinal, s.Cfg.Name)
+	}
+	return fmt.Sprintf("ord=%d", s.Cfg.Ordinal)
+}
+
+func (s *ServerGroup) logTargetTransition(oldCount, newCount int, initial bool) {
+	fields := logrus.Fields{
+		"old_targets": oldCount,
+		"new_targets": newCount,
+	}
+	if s.Cfg != nil {
+		fields["ordinal"] = s.Cfg.Ordinal
+		if s.Cfg.Name != "" {
+			fields["name"] = s.Cfg.Name
+		}
+	}
+
+	ident := s.groupIdentifier()
+	switch {
+	case initial && newCount == 0:
+		logrus.WithFields(fields).Warnf("ServerGroup %s started with zero targets; check service discovery configuration and relabel rules", ident)
+	case oldCount > 0 && newCount == 0:
+		logrus.WithFields(fields).Warnf("ServerGroup %s transitioned to zero targets; check service discovery configuration and relabel rules", ident)
+	}
 }
 
 // Cancel stops backround processes (e.g. discovery manager)
@@ -105,6 +174,15 @@ func (s *ServerGroup) Cancel() {
 func (s *ServerGroup) RoundTrip(r *http.Request) (*http.Response, error) {
 	for k, v := range middleware.GetHeaders(r.Context()) {
 		r.Header.Set(k, v)
+	}
+	for k, v := range s.Cfg.HTTPClientHeaders {
+		r.Header.Set(k, v)
+		logrus.Tracef("Set ServerGroup custom header %s: %s", k, v)
+	}
+	// Ensure Body is non-nil so downstream transports (e.g. SigV4) that
+	// unconditionally read the body don't panic on GET requests.
+	if r.Body == nil {
+		r.Body = http.NoBody
 	}
 	return s.client.Transport.RoundTrip(r)
 }
@@ -140,6 +218,11 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 	apiClients := make([]promclient.API, 0)
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
+	oldState := s.State()
+	oldCount := 0
+	if oldState != nil {
+		oldCount = len(oldState.Targets)
+	}
 	defer func() {
 		if err != nil {
 			ctxCancel()
@@ -168,10 +251,10 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 				lset := labels.New(lbls...)
 
 				logrus.Tracef("Potential target pre-relabel: %v", lset)
-				lset = relabel.Process(lset, s.Cfg.RelabelConfigs...)
+				lset, keep := relabel.Process(lset, s.Cfg.RelabelConfigs...)
 				logrus.Tracef("Potential target post-relabel: %v", lset)
 				// Check if the target was dropped, if so we skip it
-				if len(lset) == 0 {
+				if !keep || lset.IsEmpty() {
 					continue
 				}
 
@@ -198,7 +281,7 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 				}
 
 				var apiClient promclient.API
-				apiClient = &promclient.PromAPIV1{v1.NewAPI(client)}
+				apiClient = &promclient.PromAPIV1{API: v1.NewAPI(client), Client: client}
 
 				// If debug logging is enabled, wrap the client with a debugAPI client
 				// Since these are called in the reverse order of what we add, we want
@@ -212,7 +295,9 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 					cfg := &remote.ClientConfig{
 						URL:              &config_util.URL{u},
 						HTTPClientConfig: s.Cfg.HTTPConfig.HTTPConfig,
+						SigV4Config:      s.Cfg.HTTPConfig.SigV4Config,
 						Timeout:          model.Duration(time.Minute * 2),
+						ChunkedReadLimit: prom_config.DefaultChunkedReadLimit,
 					}
 					remoteStorageClient, err := remote.NewReadClient("foo", cfg)
 					if err != nil {
@@ -241,11 +326,31 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 					}
 				}
 
+				// Optionally re-stamp step-aligned query_range results back onto the
+				// requested step grid. Enabled per-server-group for backends (e.g.
+				// Mimir/Cortex) that snap query_range output to the epoch grid; see #787.
+				if s.Cfg.AlignQueryRangeWithStep {
+					apiClient = &promclient.StepAlignClient{API: apiClient}
+				}
+
 				// We remove all private labels after we set the target entry
-				modelLabelSet := make(model.LabelSet, len(lset))
-				for _, lbl := range lset {
+				modelLabelSet := make(model.LabelSet, lset.Len())
+				lset.Range(func(lbl labels.Label) {
 					if !strings.HasPrefix(string(lbl.Name), model.ReservedLabelPrefix) {
 						modelLabelSet[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
+					}
+				})
+
+				// Inject static matchers into all requests sent to this target. This is
+				// applied beneath the label-manipulation wrappers below so the matchers
+				// reach the downstream verbatim, without interacting with label_filter's
+				// query filtering or metrics_relabel's matcher reversal.
+				if injectMatchers, err := s.Cfg.GetInjectMatchers(); err != nil {
+					return err
+				} else if len(injectMatchers) > 0 {
+					apiClient, err = promclient.NewInjectMatchersClient(apiClient, injectMatchers)
+					if err != nil {
+						return err
 					}
 				}
 
@@ -281,7 +386,7 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 	}
 
 	logrus.Debugf("Updating targets from discovery manager: %v", targets)
-	apiClient, err := promclient.NewMultiAPI(apiClients, s.Cfg.GetAntiAffinity(), apiClientMetricFunc, 1, s.Cfg.GetPreferMax())
+	apiClient, err := promclient.NewMultiAPI(apiClients, s.Cfg.GetAntiAffinity(), s.Cfg.AntiAffinityDynamic, apiClientMetricFunc, 1, s.Cfg.GetPreferMax())
 	if err != nil {
 		return err
 	}
@@ -298,7 +403,13 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 		newState.apiClient = &promclient.IgnoreErrorAPI{newState.apiClient}
 	}
 
-	oldState := s.State()   // Fetch the current state (so we can stop it)
+	if s.Cfg.DowngradeError {
+		newState.apiClient = &promclient.DowngradeErrorAPI{newState.apiClient}
+	}
+
+	s.logTargetTransition(oldCount, len(targets), !s.loaded)
+	serverGroupTargets.WithLabelValues(strconv.Itoa(s.Cfg.Ordinal), s.Cfg.Name).Set(float64(len(targets)))
+
 	s.state.Store(newState) // Store new state
 	if oldState != nil {
 		oldState.ctxCancel() // Cancel the old state
@@ -326,27 +437,46 @@ func (s *ServerGroup) ApplyConfig(cfg *Config) error {
 	// It is applied on request. So we leave out any timings here.
 	var rt http.RoundTripper = &http.Transport{
 		Proxy:               http.ProxyURL(cfg.HTTPConfig.HTTPConfig.ProxyURL.URL),
-		MaxIdleConns:        20000,
-		MaxIdleConnsPerHost: 1000, // see https://github.com/golang/go/issues/13801
+		MaxIdleConns:        cfg.MaxIdleConns,
+		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost, // see https://github.com/golang/go/issues/13801
 		DisableKeepAlives:   false,
 		TLSClientConfig:     tlsConfig,
 		// 5 minutes is typically above the maximum sane scrape interval. So we can
 		// use keepalive for all configurations.
-		IdleConnTimeout:       5 * time.Minute,
+		IdleConnTimeout:       cfg.IdleConnTimeout,
 		DialContext:           (&net.Dialer{Timeout: cfg.HTTPConfig.DialTimeout}).DialContext,
 		ResponseHeaderTimeout: cfg.Timeout,
+	}
+
+	// If SigV4 is configured, wrap the transport with SigV4 round tripper
+	if cfg.HTTPConfig.SigV4Config != nil {
+		rt, err = sigv4.NewSigV4RoundTripper(cfg.HTTPConfig.SigV4Config, rt)
+		if err != nil {
+			return errors.Wrap(err, "error creating SigV4 round tripper")
+		}
 	}
 
 	// If a bearer token is provided, create a round tripper that will set the
 	// Authorization header correctly on each request.
 	if len(cfg.HTTPConfig.HTTPConfig.BearerToken) > 0 {
-		rt = config_util.NewAuthorizationCredentialsRoundTripper("Bearer", cfg.HTTPConfig.HTTPConfig.BearerToken, rt)
+		rt = config_util.NewAuthorizationCredentialsRoundTripper("Bearer", config_util.NewInlineSecret(string(cfg.HTTPConfig.HTTPConfig.BearerToken)), rt)
 	} else if len(cfg.HTTPConfig.HTTPConfig.BearerTokenFile) > 0 {
-		rt = config_util.NewAuthorizationCredentialsFileRoundTripper("Bearer", cfg.HTTPConfig.HTTPConfig.BearerTokenFile, rt)
+		rt = config_util.NewAuthorizationCredentialsRoundTripper("Bearer", config_util.NewFileSecret(cfg.HTTPConfig.HTTPConfig.BearerTokenFile), rt)
 	}
 
 	if cfg.HTTPConfig.HTTPConfig.BasicAuth != nil {
-		rt = config_util.NewBasicAuthRoundTripper(cfg.HTTPConfig.HTTPConfig.BasicAuth.Username, cfg.HTTPConfig.HTTPConfig.BasicAuth.Password, cfg.HTTPConfig.HTTPConfig.BasicAuth.PasswordFile, rt)
+		var passwordSecret config_util.SecretReader
+		switch {
+		case len(cfg.HTTPConfig.HTTPConfig.BasicAuth.Password) > 0:
+			passwordSecret = config_util.NewInlineSecret(string(cfg.HTTPConfig.HTTPConfig.BasicAuth.Password))
+		case len(cfg.HTTPConfig.HTTPConfig.BasicAuth.PasswordFile) > 0:
+			passwordSecret = config_util.NewFileSecret(cfg.HTTPConfig.HTTPConfig.BasicAuth.PasswordFile)
+		}
+		rt = config_util.NewBasicAuthRoundTripper(
+			config_util.NewInlineSecret(cfg.HTTPConfig.HTTPConfig.BasicAuth.Username),
+			passwordSecret,
+			rt,
+		)
 	}
 
 	s.client = &http.Client{Transport: rt}
@@ -354,6 +484,25 @@ func (s *ServerGroup) ApplyConfig(cfg *Config) error {
 	if err := s.targetManager.ApplyConfig(map[string]discovery.Configs{"foo": cfg.ServiceDiscoveryConfigs}); err != nil {
 		return err
 	}
+
+	// Start the metadata cache if histogram routing is configured to use it.
+	// The cache's start is idempotent — repeated ApplyConfig calls won't
+	// spawn duplicate goroutines.
+	s.histogramCache.start(
+		s.ctx,
+		func() promclient.API {
+			st := s.State()
+			if st == nil {
+				return nil
+			}
+			return st.apiClient
+		},
+		cfg.NativeHistogram.MetadataRefresh,
+		logrus.WithFields(logrus.Fields{
+			"component": "histogram-metadata-cache",
+			"sg":        cfg.Ordinal,
+		}),
+	)
 	return nil
 }
 
@@ -367,17 +516,17 @@ func (s *ServerGroup) State() *ServerGroupState {
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (s *ServerGroup) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (s *ServerGroup) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	return s.State().apiClient.GetValue(ctx, start, end, matchers)
 }
 
 // Query performs a query for the given time.
-func (s *ServerGroup) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (s *ServerGroup) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	return s.State().apiClient.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (s *ServerGroup) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (s *ServerGroup) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	return s.State().apiClient.QueryRange(ctx, query, r)
 }
 
@@ -399,4 +548,9 @@ func (s *ServerGroup) Series(ctx context.Context, matches []string, startTime, e
 // Metadata returns metadata about metrics currently scraped by the metric name.
 func (s *ServerGroup) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
 	return s.State().apiClient.Metadata(ctx, metric, limit)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (s *ServerGroup) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	return s.State().apiClient.QueryExemplars(ctx, query, startTime, endTime)
 }

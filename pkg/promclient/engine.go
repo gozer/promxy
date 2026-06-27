@@ -11,17 +11,21 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
+
+	"github.com/jacksontj/promxy/pkg/promapi"
 )
 
-// StorageWarningsToAPIWarnings simply converts `storage.Warnings` to `v1.Warnings`
-// which is simply converting a []error -> []string
+// AnnotationsToAPIWarnings converts annotations.Annotations to v1.Warnings.
 // TODO: move to a util package?
-func StorageWarningsToAPIWarnings(warnings storage.Warnings) v1.Warnings {
-	ret := make(v1.Warnings, len(warnings))
-	for i, w := range warnings {
-		ret[i] = w.Error()
+func AnnotationsToAPIWarnings(anns annotations.Annotations) v1.Warnings {
+	if len(anns) == 0 {
+		return nil
 	}
-
+	ret := make(v1.Warnings, 0, len(anns))
+	for _, w := range anns {
+		ret = append(ret, w.Error())
+	}
 	return ret
 }
 
@@ -32,21 +36,33 @@ func ParserValueToModelValue(value parser.Value) (model.Value, error) {
 		matrix := make(model.Matrix, v.Len())
 		for i, item := range v {
 			metric := make(model.Metric)
-			for _, label := range item.Metric {
+			item.Metric.Range(func(label labels.Label) {
 				metric[model.LabelName(label.Name)] = model.LabelValue(label.Value)
-			}
+			})
 
-			samples := make([]model.SamplePair, len(item.Points))
-			for x, sample := range item.Points {
+			samples := make([]model.SamplePair, len(item.Floats))
+			for x, sample := range item.Floats {
 				samples[x] = model.SamplePair{
 					Timestamp: model.Time(sample.T),
-					Value:     model.SampleValue(sample.V),
+					Value:     model.SampleValue(sample.F),
+				}
+			}
+
+			var histograms []model.SampleHistogramPair
+			if len(item.Histograms) > 0 {
+				histograms = make([]model.SampleHistogramPair, len(item.Histograms))
+				for x, p := range item.Histograms {
+					histograms[x] = model.SampleHistogramPair{
+						Timestamp: model.Time(p.T),
+						Histogram: floatHistogramToSampleHistogram(p.H),
+					}
 				}
 			}
 
 			matrix[i] = &model.SampleStream{
-				Metric: metric,
-				Values: samples,
+				Metric:     metric,
+				Values:     samples,
+				Histograms: histograms,
 			}
 		}
 		return matrix, nil
@@ -80,28 +96,28 @@ func (a *EngineAPI) LabelValues(ctx context.Context, label string, matchers []st
 }
 
 // Query performs a query for the given time.
-func (a *EngineAPI) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
-	return nil, nil, fmt.Errorf("not implemented")
+func (a *EngineAPI) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
+	return storage.ErrSeriesSet(fmt.Errorf("not implemented"))
 }
 
 // QueryRange performs a query for the given range.
-func (a *EngineAPI) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
-	engineQuery, err := a.e.NewRangeQuery(a.q, &promql.QueryOpts{false}, query, r.Start, r.End, r.Step)
+func (a *EngineAPI) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
+	engineQuery, err := a.e.NewRangeQuery(ctx, a.q, promql.NewPrometheusQueryOpts(false, 0), query, r.Start, r.End, r.Step)
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 
 	result := engineQuery.Exec(ctx)
 	if result.Err != nil {
-		return nil, StorageWarningsToAPIWarnings(result.Warnings), result.Err
+		return promapi.NewSeriesSet(nil, result.Warnings, result.Err)
 	}
 
 	val, err := ParserValueToModelValue(result.Value)
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 
-	return val, StorageWarningsToAPIWarnings(result.Warnings), nil
+	return ModelValueToSeriesSet(val, result.Warnings, nil)
 }
 
 // Series finds series by label matchers.
@@ -110,11 +126,16 @@ func (a *EngineAPI) Series(ctx context.Context, matches []string, startTime time
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (a *EngineAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
-	return nil, nil, fmt.Errorf("not implemented")
+func (a *EngineAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
+	return storage.ErrSeriesSet(fmt.Errorf("not implemented"))
 }
 
 // Metadata returns metadata about metrics currently scraped by the metric name.
 func (a *EngineAPI) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (a *EngineAPI) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
 	return nil, fmt.Errorf("not implemented")
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 
@@ -197,85 +198,81 @@ func (c *MetricsRelabelClient) LabelNames(ctx context.Context, matchers []string
 	}
 
 	// Now that we have the result; we need to run the relabel on the lbls
-	lbls := make(labels.Labels, len(labelNames))
-	for i, lName := range labelNames {
-		lbls[i] = labels.Label{Name: lName, Value: "placeholder"}
+	lb := labels.NewScratchBuilder(len(labelNames))
+	for _, lName := range labelNames {
+		lb.Add(lName, "placeholder")
+	}
+	lb.Sort()
+	lbls, keep := relabel.Process(lb.Labels(), c.RelabelConfigs...)
+	if !keep {
+		return nil, w, err
 	}
 
-	lbls = relabel.Process(lbls, c.RelabelConfigs...)
-
-	newLabelNames := make([]string, len(lbls))
-	for i, lbl := range lbls {
-		newLabelNames[i] = lbl.Name
-	}
+	newLabelNames := make([]string, 0, lbls.Len())
+	lbls.Range(func(lbl labels.Label) {
+		newLabelNames = append(newLabelNames, lbl.Name)
+	})
 
 	return newLabelNames, w, err
 }
 
 // Query performs a query for the given time.
-func (c *MetricsRelabelClient) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (c *MetricsRelabelClient) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	// rewrite the query to the new labels
-	logrus.Debugf("Query before label replacement: " + query)
+	logrus.Debugf("Query before label replacement: %s", query)
 	e, err := parser.ParseExpr(query)
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 
 	// Walk the expression, to filter out any LabelMatchers that match etc.
 	replaceVisitor := NewMetricsRelabelVisitor(c.MetricsRelabelConfigs, c.RelabelConfigs)
 	if _, err := parser.Walk(ctx, replaceVisitor, &parser.EvalStmt{Expr: e}, e, nil, nil); err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 	if replaceVisitor.badLabel {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	newQuery := e.String()
-	logrus.Debugf("Query after label replacement: " + newQuery)
+	logrus.Debugf("Query after label replacement: %s", newQuery)
 
-	val, w, err := c.API.Query(ctx, newQuery, ts)
-	if err != nil {
-		return nil, w, err
-	}
+	return MapLabelsSeriesSet(c.API.Query(ctx, newQuery, ts), c.relabelLabels)
+}
 
-	// run relabel on the results
-	if err := c.replaceValueLabels(val); err != nil {
-		return nil, nil, err
+// relabelLabels applies the relabel configs to a series' labels (the result-side
+// of the rewrite). A dropped series (keep=false) is rendered with empty labels,
+// matching the previous model.Value behavior.
+func (c *MetricsRelabelClient) relabelLabels(l labels.Labels) labels.Labels {
+	lbls, keep := relabel.Process(l, c.RelabelConfigs...)
+	if !keep {
+		return labels.EmptyLabels()
 	}
-	return val, w, nil
+	return lbls
 }
 
 // QueryRange performs a query for the given range.
-func (c *MetricsRelabelClient) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (c *MetricsRelabelClient) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	// rewrite the query to the new labels
-	logrus.Debugf("Query before label replacement: " + query)
+	logrus.Debugf("Query before label replacement: %s", query)
 	e, err := parser.ParseExpr(query)
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 
 	// Walk the expression, to filter out any LabelMatchers that match etc.
 	replaceVisitor := NewMetricsRelabelVisitor(c.MetricsRelabelConfigs, c.RelabelConfigs)
 	if _, err := parser.Walk(ctx, replaceVisitor, &parser.EvalStmt{Expr: e}, e, nil, nil); err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 	if replaceVisitor.badLabel {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	newQuery := e.String()
-	logrus.Debugf("Query after label replacement: " + newQuery)
+	logrus.Debugf("Query after label replacement: %s", newQuery)
 
-	val, w, err := c.API.QueryRange(ctx, newQuery, r)
-	if err != nil {
-		return nil, w, err
-	}
-
-	// run relabel on the results
-	if err := c.replaceValueLabels(val); err != nil {
-		return nil, nil, err
-	}
-	return val, w, nil
+	return MapLabelsSeriesSet(c.API.QueryRange(ctx, newQuery, r), c.relabelLabels)
 }
 
 // Series finds series by label matchers.
@@ -299,71 +296,65 @@ func (c *MetricsRelabelClient) Series(ctx context.Context, matchers []string, st
 
 	labelsets, w, err := c.API.Series(ctx, newMatchers, startTime, endTime)
 	for i, labelset := range labelsets {
-		lbls := make(labels.Labels, 0, len(labelset))
+		lb := labels.NewScratchBuilder(len(labelset))
 		for k, v := range labelset {
-			lbls = append(lbls, labels.Label{Name: string(k), Value: string(v)})
+			lb.Add(string(k), string(v))
 		}
-
-		lbls = relabel.Process(lbls, c.RelabelConfigs...)
-		newLabelset := make(model.LabelSet, len(lbls))
-		for _, lbl := range lbls {
+		lb.Sort()
+		lbls, keep := relabel.Process(lb.Labels(), c.RelabelConfigs...)
+		if !keep {
+			labelsets[i] = nil
+			continue
+		}
+		newLabelset := make(model.LabelSet, lbls.Len())
+		lbls.Range(func(lbl labels.Label) {
 			newLabelset[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
-		}
+		})
 		labelsets[i] = newLabelset
 	}
 	return labelsets, w, err
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (c *MetricsRelabelClient) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (c *MetricsRelabelClient) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	newMatchers, ok := RewriteMatchers(c.MetricsRelabelConfigs, matchers)
 	if !ok {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
-
-	val, w, err := c.API.GetValue(ctx, start, end, newMatchers)
-	if err != nil {
-		return nil, w, err
-	}
-	// run relabel on the results
-	if err := c.replaceValueLabels(val); err != nil {
-		return nil, nil, err
-	}
-	return val, w, err
+	return MapLabelsSeriesSet(c.API.GetValue(ctx, start, end, newMatchers), c.relabelLabels)
 }
 
-// replaceValueLabels runs the Relabeling across the model.Value passed in
-func (c *MetricsRelabelClient) replaceValueLabels(a model.Value) error {
-	switch aTyped := a.(type) {
-	case model.Vector:
-		for _, item := range aTyped {
-			labelStrings := make([]string, 0, len(item.Metric)*2)
-			for k, v := range item.Metric {
-				labelStrings = append(labelStrings, string(k), string(v))
-			}
-
-			lbls := relabel.Process(labels.FromStrings(labelStrings...), c.RelabelConfigs...)
-			item.Metric = make(map[model.LabelName]model.LabelValue)
-			for _, lbl := range lbls {
-				item.Metric[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
-			}
-		}
-
-	case model.Matrix:
-		for _, item := range aTyped {
-			labelStrings := make([]string, 0, len(item.Metric)*2)
-			for k, v := range item.Metric {
-				labelStrings = append(labelStrings, string(k), string(v))
-			}
-
-			item.Metric = make(map[model.LabelName]model.LabelValue)
-			for _, lbl := range relabel.Process(labels.FromStrings(labelStrings...), c.RelabelConfigs...) {
-				item.Metric[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
-			}
-		}
+// QueryExemplars performs a query for exemplars by the given query and time range.
+// We pass the query through unmodified — rewriting selectors inside an arbitrary
+// PromQL expression is non-trivial — and apply the configured relabel rules to
+// each result's SeriesLabels so caller-side labels match the rewritten metric
+// names.
+func (c *MetricsRelabelClient) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	v, err := c.API.QueryExemplars(ctx, query, startTime, endTime)
+	if err != nil {
+		return nil, err
 	}
-
-	return nil
+	if len(c.RelabelConfigs) == 0 {
+		return v, nil
+	}
+	out := v[:0]
+	for _, qr := range v {
+		labelStrings := make([]string, 0, len(qr.SeriesLabels)*2)
+		for k, lv := range qr.SeriesLabels {
+			labelStrings = append(labelStrings, string(k), string(lv))
+		}
+		lbls, keep := relabel.Process(labels.FromStrings(labelStrings...), c.RelabelConfigs...)
+		if !keep {
+			continue
+		}
+		ns := model.LabelSet{}
+		lbls.Range(func(lbl labels.Label) {
+			ns[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
+		})
+		qr.SeriesLabels = ns
+		out = append(out, qr)
+	}
+	return out, nil
 }
 
 func NewMetricsRelabelVisitor(m []*MetricRelabelConfig, r []*relabel.Config) *MetricsRelabelVisitor {
@@ -405,6 +396,10 @@ func (v *MetricsRelabelVisitor) Visit(node parser.Node, path []parser.Node) (w p
 	case *parser.AggregateExpr:
 		nodeTyped.Grouping = RewriteLabels(v.MetricsRelabelConfigs, nodeTyped.Grouping)
 	case *parser.BinaryExpr:
+		// If one is a literal; then it is safe to traverse
+		if ExprIsLiteral(nodeTyped.LHS) || ExprIsLiteral(nodeTyped.RHS) {
+			return v, nil
+		}
 		return nil, fmt.Errorf("metricsrelabelvisitor does not support BinaryExprs")
 	}
 

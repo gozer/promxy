@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 )
 
 func newCountAPI(a API) *countAPI {
@@ -45,13 +46,13 @@ func (s *countAPI) LabelValues(ctx context.Context, label string, matchers []str
 }
 
 // Query performs a query for the given time.
-func (s *countAPI) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (s *countAPI) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	s.callCount["Query"]++
 	return s.API.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (s *countAPI) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (s *countAPI) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	s.callCount["QueryRange"]++
 	return s.API.QueryRange(ctx, query, r)
 }
@@ -63,7 +64,7 @@ func (s *countAPI) Series(ctx context.Context, matches []string, startTime time.
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (s *countAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (s *countAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	s.callCount["GetValue"]++
 	return s.API.GetValue(ctx, start, end, matchers)
 }
@@ -72,6 +73,12 @@ func (s *countAPI) GetValue(ctx context.Context, start, end time.Time, matchers 
 func (s *countAPI) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
 	s.callCount["Metadata"]++
 	return s.API.Metadata(ctx, metric, limit)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (s *countAPI) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	s.callCount["QueryExemplars"]++
+	return s.API.QueryExemplars(ctx, query, startTime, endTime)
 }
 
 func TestLabelFilter(t *testing.T) {
@@ -145,7 +152,7 @@ func TestLabelFilter(t *testing.T) {
 		for i, test := range tests {
 			t.Run(strconv.Itoa(i), func(t *testing.T) {
 				beforeCount := countAPI.callCount["Query"]
-				_, _, err := filterClient.Query(ctx, test.query, model.Time(100).Time())
+				err := filterClient.Query(ctx, test.query, model.Time(100).Time()).Err()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -161,7 +168,7 @@ func TestLabelFilter(t *testing.T) {
 		for i, test := range tests {
 			t.Run(strconv.Itoa(i), func(t *testing.T) {
 				beforeCount := countAPI.callCount["QueryRange"]
-				_, _, err := filterClient.QueryRange(ctx, test.query, v1.Range{Start: model.Time(0).Time(), End: model.Time(100).Time(), Step: time.Millisecond})
+				err := filterClient.QueryRange(ctx, test.query, v1.Range{Start: model.Time(0).Time(), End: model.Time(100).Time(), Step: time.Millisecond}).Err()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -200,7 +207,7 @@ func TestLabelFilter(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				_, _, err = filterClient.GetValue(ctx, model.Time(0).Time(), model.Time(100).Time(), matchers)
+				err = filterClient.GetValue(ctx, model.Time(0).Time(), model.Time(100).Time(), matchers).Err()
 				if err != nil {
 					t.Fatal(err)
 				}
